@@ -13,7 +13,9 @@ import (
 	autogen_client "github.com/kagent-dev/kagent/go/autogen/client"
 	"github.com/kagent-dev/kagent/go/controller/api/v1alpha1"
 	common "github.com/kagent-dev/kagent/go/controller/internal/utils"
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -51,8 +53,8 @@ type apiTranslator struct {
 }
 
 func (a *apiTranslator) TranslateToolServer(ctx context.Context, toolServer *v1alpha1.ToolServer) (*autogen_client.ToolServer, error) {
-	// provder = "kagent.tool_servers.StdioMcpToolServer" || "kagent.tool_servers.SseMcpToolServer"
-	provider, toolServerConfig, err := translateToolServerConfig(toolServer.Spec.Config)
+	// provider = "kagent.tool_servers.StdioMcpToolServer" || "kagent.tool_servers.SseMcpToolServer"
+	provider, toolServerConfig, err := a.translateToolServerConfig(ctx, toolServer.Spec.Config, toolServer.ObjectMeta.Namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -82,14 +84,19 @@ func commandAlias(command string) string {
 	return command
 }
 
-func translateToolServerConfig(config v1alpha1.ToolServerConfig) (string, *api.ToolServerConfig, error) {
+func (a *apiTranslator) translateToolServerConfig(ctx context.Context, config v1alpha1.ToolServerConfig, namespace string) (string, *api.ToolServerConfig, error) {
 	switch {
 	case config.Stdio != nil:
+		env, err := makeEnvironmentVariables(ctx, a.kube, config.Stdio.Env, config.Stdio.EnvFrom, namespace)
+		if err != nil {
+			return "", nil, err
+		}
+
 		return "kagent.tool_servers.StdioMcpToolServer", &api.ToolServerConfig{
 			StdioMcpServerConfig: &api.StdioMcpServerConfig{
 				Command: commandAlias(config.Stdio.Command),
 				Args:    config.Stdio.Args,
-				Env:     config.Stdio.Env,
+				Env:     env,
 			},
 		}, nil
 	case config.Sse != nil:
@@ -117,6 +124,98 @@ func translateToolServerConfig(config v1alpha1.ToolServerConfig) (string, *api.T
 	}
 
 	return "", nil, fmt.Errorf("unsupported tool server config")
+}
+
+// Make the environment variables
+func makeEnvironmentVariables(ctx context.Context, kubeClient client.Client, env map[string]string, envFrom []corev1.EnvFromSource, namespace string) (map[string]string, error) {
+	if len(envFrom) == 0 {
+		return env, nil
+	}
+
+	result := make(map[string]string)
+
+	var (
+		configMaps = make(map[string]*corev1.ConfigMap)
+		secrets    = make(map[string]*corev1.Secret)
+	)
+
+	// Process envFrom first then allow env to replace existing values.
+	for _, envFrom := range envFrom {
+		switch {
+		case envFrom.ConfigMapRef != nil:
+			cm := envFrom.ConfigMapRef
+			name := cm.Name
+			configMap, ok := configMaps[name]
+			if !ok {
+				if kubeClient == nil {
+					return result, fmt.Errorf("couldn't get configMap %v/%v, no kubeClient defined", namespace, name)
+				}
+				optional := cm.Optional != nil && *cm.Optional
+				configMap = &corev1.ConfigMap{}
+				if err := fetchObjKube(
+					ctx,
+					kubeClient,
+					configMap,
+					name,
+					namespace,
+				); err != nil {
+					if errors.IsNotFound(err) && optional {
+						// ignore error when marked optional
+						continue
+					}
+					return result, err
+				}
+				configMaps[name] = configMap
+			}
+
+			for k, v := range configMap.Data {
+				if len(envFrom.Prefix) > 0 {
+					k = envFrom.Prefix + k
+				}
+
+				result[k] = v
+			}
+		case envFrom.SecretRef != nil:
+			s := envFrom.SecretRef
+			name := s.Name
+			secret, ok := secrets[name]
+			if !ok {
+				if kubeClient == nil {
+					return result, fmt.Errorf("couldn't get secret %v/%v, no kubeClient defined", namespace, name)
+				}
+				optional := s.Optional != nil && *s.Optional
+				secret = &corev1.Secret{}
+				if err := fetchObjKube(
+					ctx,
+					kubeClient,
+					secret,
+					name,
+					namespace,
+				); err != nil {
+					if errors.IsNotFound(err) && optional {
+						// ignore error when marked optional
+						continue
+					}
+					return result, err
+				}
+				secrets[name] = secret
+			}
+
+			for k, v := range secret.Data {
+				if len(envFrom.Prefix) > 0 {
+					k = envFrom.Prefix + k
+				}
+
+				result[k] = string(v)
+			}
+		}
+	}
+
+	for k, v := range env {
+		result[k] = v
+	}
+
+	return result, nil
 }
 
 func convertDurationToSeconds(timeout string) (int, error) {
