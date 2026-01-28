@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import { convertToUserFriendlyName, messageUtils } from "@/lib/utils";
 import { TokenStats, ChatStatus } from "@/types";
 import { mapA2AStateToStatus } from "@/lib/statusUtils";
+import { isToolApprovalInterrupt, KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL } from "@/lib/hitl";
 
 // Helper functions for extracting data from stored tasks
 export function extractMessagesFromTasks(tasks: Task[]): Message[] {
@@ -332,6 +333,32 @@ export const createMessageHandlers = (handlers: MessageHandlers) => {
 
         // Skip user messages to avoid duplicates (they're already shown immediately)
         if (isUserMessage(message)) {
+          return;
+        }
+
+        // Check for tool approval interrupt (HITL) - preserve the full message for the approval UI
+        // Backend converts framework-specific formats to the generic interrupt_type/action_requests format
+        const hasToolApprovalData = message.parts?.some(part => {
+          if (isDataPart(part)) {
+            return isToolApprovalInterrupt(part.data);
+          }
+          return false;
+        });
+
+        if (hasToolApprovalData && statusUpdate.status.state === "input-required") {
+          const messageWithInputFlag = {
+            ...message,
+            metadata: {
+              ...message.metadata,
+              awaiting_input: true,
+            }
+          };
+          handlers.setMessages(prevMessages => [...prevMessages, messageWithInputFlag]);
+          handlers.setIsStreaming(false);
+          handlers.setStreamingContent(() => "");
+          if (handlers.setChatStatus) {
+            handlers.setChatStatus("input_required");
+          }
           return;
         }
 

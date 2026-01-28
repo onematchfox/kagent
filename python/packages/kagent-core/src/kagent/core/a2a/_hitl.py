@@ -17,6 +17,7 @@ from a2a.types import (
     Message,
     Part,
     Role,
+    Task,
     TaskState,
     TaskStatus,
     TaskStatusUpdateEvent,
@@ -39,7 +40,22 @@ logger = logging.getLogger(__name__)
 # Type definitions
 
 DecisionType = Literal["approve", "deny", "reject"]
-"""Type for user decisions in HITL workflows."""
+"""Represents a user decision in HITL workflows."""
+
+
+@dataclass
+class ToolDecision:
+    """Type for user decisions in HITL workflows.
+
+    Represents both the decision type and, optionally, the tool to which the decision applies.
+
+    Attributes:
+        decision_type: The type of decision (approve, deny, reject)
+        tool_id: The ID of the tool to which the decision applies, or None if the decision applies to all tools
+    """
+
+    decision_type: DecisionType
+    tool_id: str | None
 
 
 @dataclass
@@ -52,11 +68,13 @@ class ToolApprovalRequest:
         name: The name of the tool/function being called
         args: Dictionary of arguments to pass to the tool
         id: Optional unique identifier for this specific tool call
+        metadata: Optional framework-specific data
     """
 
     name: str
     args: dict[str, Any]
     id: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 # Utility functions
@@ -93,26 +111,34 @@ def is_input_required_task(task_state: TaskState | None) -> bool:
     return task_state == TaskState.input_required
 
 
-def extract_decision_from_data_part(data: dict) -> DecisionType | None:
-    """Extract decision type from structured DataPart.
+def _is_valid_decision(decision: str | None) -> bool:
+    """Check if a decision value is valid."""
+    return decision in (
+        KAGENT_HITL_DECISION_TYPE_APPROVE,
+        KAGENT_HITL_DECISION_TYPE_DENY,
+        KAGENT_HITL_DECISION_TYPE_REJECT,
+    )
 
-    Looks for the decision_type key in the data dictionary and validates
-    it's a known decision value.
+
+def extract_decision_from_data_part(data: dict) -> ToolDecision | None:
+    """Extract decision from structured DataPart.
+
+    Supports two formats using the same decision_type key:
+    1. Global format: {decision_type: "approve"} - applies to all tools
+    2. Per-tool format: {decision_type: "approve", tool_id: "call_123"} - specific tool
 
     Args:
         data: DataPart.data dictionary
 
     Returns:
-        Decision type if found and valid, None otherwise
+        ToolDecision if found and valid, None otherwise.
+        tool_id is None for global decisions.
     """
     decision = data.get(KAGENT_HITL_DECISION_TYPE_KEY)
-    if decision in (
-        KAGENT_HITL_DECISION_TYPE_APPROVE,
-        KAGENT_HITL_DECISION_TYPE_DENY,
-        KAGENT_HITL_DECISION_TYPE_REJECT,
-    ):
-        return decision
-    return None
+    if not _is_valid_decision(decision):
+        return None
+
+    return ToolDecision(decision_type=decision, tool_id=data.get("tool_id"))
 
 
 def extract_decision_from_text(text: str) -> DecisionType | None:
@@ -141,11 +167,11 @@ def extract_decision_from_text(text: str) -> DecisionType | None:
     return None
 
 
-def extract_decision_from_message(message: Message | None) -> DecisionType | None:
+def extract_decision_from_message(message: Message | None) -> ToolDecision | None:
     """Extract decision from A2A message using two-tier detection.
 
     Priority:
-    1. Structured DataPart with decision_type field (most reliable)
+    1. Structured DataPart with decision fields (most reliable)
     2. Keyword matching in TextPart (fallback for human input)
 
     DataPart is checked across all parts first before falling back to TextPart,
@@ -155,7 +181,8 @@ def extract_decision_from_message(message: Message | None) -> DecisionType | Non
         message: A2A message from user
 
     Returns:
-        Decision type if found, None otherwise
+        ToolDecision if found, None otherwise.
+        tool_id is None for global decisions or text-based decisions.
     """
     if not message or not message.parts:
         return None
@@ -169,11 +196,12 @@ def extract_decision_from_message(message: Message | None) -> DecisionType | Non
         inner = part.root
 
         if isinstance(inner, DataPart):
-            decision = extract_decision_from_data_part(inner.data)
-            if decision:
-                return decision
+            result = extract_decision_from_data_part(inner.data)
+            if result:
+                logger.info(f"Extracted decision from DataPart: {inner.data}")
+                return result
 
-    # Priority 2: Fallback to TextPart keyword matching
+    # Priority 2: Fallback to TextPart keyword matching (no tool_id)
     for part in message.parts:
         if not hasattr(part, "root"):
             continue
@@ -184,9 +212,85 @@ def extract_decision_from_message(message: Message | None) -> DecisionType | Non
             if inner.text and isinstance(inner.text, str):
                 decision = extract_decision_from_text(inner.text)
                 if decision:
-                    return decision
+                    logger.info(f"Extracted decision from TextPart: {inner.text}")
+                    return ToolDecision(decision_type=decision, tool_id=None)
 
     return None
+
+
+def extract_tool_requests_from_message(message: Message | None) -> list[ToolApprovalRequest]:
+    """Extract tool approval requests from an input_required task message.
+
+    Args:
+        message: The task status message from an input_required task
+
+    Returns:
+        List of ToolApprovalRequest objects, empty if none found
+    """
+    if not message or not message.parts:
+        return []
+
+    for _i, part in enumerate(message.parts):
+        if not hasattr(part, "root"):
+            continue
+
+        inner = part.root
+
+        if isinstance(inner, DataPart) and inner.data:
+            if inner.data.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL:
+                action_requests = inner.data.get("action_requests", [])
+                return [
+                    ToolApprovalRequest(
+                        name=req.get("name", ""),
+                        args=req.get("args", {}),
+                        id=req.get("id"),
+                        metadata=req.get("metadata"),
+                    )
+                    for req in action_requests
+                ]
+
+    return []
+
+
+def find_pending_tool_request(
+    task: Task | None,
+    tool_id: str | None,
+) -> ToolApprovalRequest | None:
+    """Find a pending tool approval request matching the given tool_id.
+
+    Searches the task's status message first, then history (most recent first).
+
+    Args:
+        task: The current A2A task
+        tool_id: The tool ID to match (matches against request.id)
+
+    Returns:
+        The matching ToolApprovalRequest, or None if not found
+    """
+    if not task:
+        return None
+
+    tool_requests = []
+
+    # First check the task's current status message
+    task_message = task.status.message if task.status else None
+    if task_message:
+        tool_requests = extract_tool_requests_from_message(task_message)
+
+    # If no requests found in status.message, search task history
+    if not tool_requests and task.history:
+        for msg in reversed(task.history):
+            tool_requests = extract_tool_requests_from_message(msg)
+            if tool_requests:
+                break
+
+    if not tool_requests:
+        return None
+
+    return next(
+        (t for t in tool_requests if (t.id and t.id == tool_id)),
+        None,
+    )
 
 
 def format_tool_approval_text_parts(
@@ -263,7 +367,7 @@ async def handle_tool_approval_interrupt(
     text_parts = format_tool_approval_text_parts(action_requests)
 
     # Build structured DataPart for machine processing (client can parse this)
-    interrupt_data = {
+    interrupt_data: dict[str, Any] = {
         "interrupt_type": KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL,
         "action_requests": [{"name": req.name, "args": req.args, "id": req.id} for req in action_requests],
     }

@@ -23,18 +23,27 @@ from a2a.types import (
 from google.adk.events import Event, EventActions
 from google.adk.runners import Runner
 from google.adk.utils.context_utils import Aclosing
-from opentelemetry import trace
+from google.genai import types as genai_types
 from pydantic import BaseModel
 from typing_extensions import override
 
-from kagent.core.a2a import TaskResultAggregator, get_kagent_metadata_key
+from kagent.core.a2a import (
+    TaskResultAggregator,
+    ToolDecision,
+    extract_decision_from_message,
+    find_pending_tool_request,
+    get_kagent_metadata_key,
+)
 from kagent.core.tracing._span_processor import (
     clear_kagent_span_attributes,
     set_kagent_span_attributes,
 )
 
 from .converters.event_converter import convert_event_to_a2a_events
-from .converters.request_converter import convert_a2a_request_to_adk_run_args
+from .converters.request_converter import (
+    convert_a2a_request_to_adk_run_args,
+    convert_tool_decision_to_adk_function_response,
+)
 
 logger = logging.getLogger("kagent_adk." + __name__)
 
@@ -216,6 +225,14 @@ class A2aAgentExecutor(AgentExecutor):
 
         await runner.session_service.append_event(session, system_event)
 
+        if context.current_task:
+            tool_decision = extract_decision_from_message(context.message)
+            if tool_decision:
+                # If this is a HITL resume with a tool decision, replace the message with an ADK tool confirmation response
+                confirmation_message = self._prepare_confirmation_message(context, tool_decision)
+                if confirmation_message:
+                    run_args["new_message"] = confirmation_message
+
         # create invocation context
         invocation_context = runner._new_invocation_context(
             session=session,
@@ -252,6 +269,18 @@ class A2aAgentExecutor(AgentExecutor):
                     if not adk_event.partial:
                         task_result_aggregator.process_event(a2a_event)
                     await event_queue.enqueue_event(a2a_event)
+
+                # Break out of runner loop when input is required (tool
+                # confirmation, long-running tools, or other scenarios needing
+                # external input). ADK's McpToolset doesn't properly interrupt
+                # the runner when require_confirmation=True - it continues
+                # running after emitting the confirmation event. Some models
+                # (e.g., gpt-5-mini) interpret the empty placeholder response as
+                # a failure and retry, while others (e.g., gpt-4o) don't.
+                # Breaking here ensures consistent behavior regardless of model.
+                if task_result_aggregator.task_state == TaskState.input_required:
+                    logger.info("Breaking runner loop: input_required state detected")
+                    break
 
         # publish the task result event - this is final
         if (
@@ -333,3 +362,42 @@ class A2aAgentExecutor(AgentExecutor):
             run_args["session_id"] = session.id
 
         return session
+
+    def _prepare_confirmation_message(
+        self,
+        context: RequestContext,
+        tool_decision: ToolDecision,
+    ) -> genai_types.Content | None:
+        """Prepare confirmation message for HITL resume.
+
+        Finds the pending tool request matching the user's decision and extracts
+        the confirmation_id from its metadata to create an ADK FunctionResponse.
+
+        Args:
+            context: The request context containing the current task
+            tool_decision: The user's decision (approve/deny) and tool ID
+
+        Returns:
+            The confirmation Content to send to ADK, or None if no match found
+        """
+        matched_request = find_pending_tool_request(context.current_task, tool_decision.tool_id)
+        if not matched_request:
+            logger.error(f"No pending tool request found for tool_id: {tool_decision.tool_id}")
+            return None
+
+        # Get the ADK confirmation ID from the request's metadata
+        confirmation_id = matched_request.metadata.get("confirmation_id") if matched_request.metadata else None
+        if not confirmation_id:
+            logger.error(f"No confirmation_id in metadata for tool request: {matched_request.id}")
+            return None
+
+        logger.info(
+            f"HITL resume: {tool_decision.decision_type} for {matched_request.name} (confirmation_id={confirmation_id})"
+        )
+
+        # Create a ToolDecision with the ADK confirmation ID for the response
+        decision_with_confirmation_id = ToolDecision(
+            decision_type=tool_decision.decision_type,
+            tool_id=confirmation_id,
+        )
+        return convert_tool_decision_to_adk_function_response(decision_with_confirmation_id)

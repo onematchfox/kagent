@@ -18,8 +18,11 @@ from ._consts import (
 from ._hitl import (
     DecisionType,
     ToolApprovalRequest,
+    ToolDecision,
     escape_markdown_backticks,
     extract_decision_from_message,
+    extract_tool_requests_from_message,
+    find_pending_tool_request,
     format_tool_approval_text_parts,
     handle_tool_approval_interrupt,
     is_input_required_task,
@@ -51,9 +54,12 @@ __all__ = [
     # HITL types
     "DecisionType",
     "ToolApprovalRequest",
+    "ToolDecision",
     # HITL utilities
     "escape_markdown_backticks",
     "extract_decision_from_message",
+    "extract_tool_requests_from_message",
+    "find_pending_tool_request",
     "format_tool_approval_text_parts",
     "is_input_required_task",
     # HITL handlers

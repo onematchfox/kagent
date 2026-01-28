@@ -137,16 +137,20 @@ def _convert_ollama_options(options: dict[str, str] | None) -> dict[str, Any]:
     return converted
 
 
-class HttpMcpServerConfig(BaseModel):
+class McpServerConfig(BaseModel):
+    """Common configuration for MCP servers."""
+
+    tools: list[str] = Field(default_factory=list)
+    allowed_headers: list[str] | None = None  # Headers to forward from A2A request to MCP calls
+    require_confirmation: bool | None = None
+
+
+class HttpMcpServerConfig(McpServerConfig):
     params: StreamableHTTPConnectionParams
-    tools: list[str] = Field(default_factory=list)
-    allowed_headers: list[str] | None = None  # Headers to forward from A2A request to MCP calls
 
 
-class SseMcpServerConfig(BaseModel):
+class SseMcpServerConfig(McpServerConfig):
     params: SseConnectionParams
-    tools: list[str] = Field(default_factory=list)
-    allowed_headers: list[str] | None = None  # Headers to forward from A2A request to MCP calls
 
 
 class RemoteAgentConfig(BaseModel):
@@ -241,13 +245,15 @@ class AgentConfig(BaseModel):
                     allowed_headers=http_tool.allowed_headers,
                     sts_header_provider=sts_header_provider,
                 )
-                tools.append(
-                    McpToolset(
-                        connection_params=http_tool.params,
-                        tool_filter=http_tool.tools,
-                        header_provider=tool_header_provider,
-                    )
-                )
+                # If the proxy is configured, the url and headers are set in the json configuration
+                toolset_kwargs: dict[str, Any] = {
+                    "connection_params": http_tool.params,
+                    "tool_filter": http_tool.tools,
+                    "header_provider": tool_header_provider,
+                }
+                if http_tool.require_confirmation:
+                    toolset_kwargs["require_confirmation"] = True
+                tools.append(McpToolset(**toolset_kwargs))
         if self.sse_tools:
             for sse_tool in self.sse_tools:  # add sse tools
                 # Create header provider combining STS and allowed headers for this tool
@@ -255,13 +261,15 @@ class AgentConfig(BaseModel):
                     allowed_headers=sse_tool.allowed_headers,
                     sts_header_provider=sts_header_provider,
                 )
-                tools.append(
-                    McpToolset(
-                        connection_params=sse_tool.params,
-                        tool_filter=sse_tool.tools,
-                        header_provider=tool_header_provider,
-                    )
-                )
+                # If the proxy is configured, the url and headers are set in the json configuration
+                toolset_kwargs: dict[str, Any] = {
+                    "connection_params": sse_tool.params,
+                    "tool_filter": sse_tool.tools,
+                    "header_provider": tool_header_provider,
+                }
+                if sse_tool.require_confirmation:
+                    toolset_kwargs["require_confirmation"] = True
+                tools.append(McpToolset(**toolset_kwargs))
         if self.remote_agents:
             for remote_agent in self.remote_agents:  # Add remote agents as tools
                 # Prepare httpx client parameters

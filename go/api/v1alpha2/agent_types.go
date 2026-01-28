@@ -262,6 +262,11 @@ type McpServerTool struct {
 	// Example: ["x-user-email", "x-tenant-id"]
 	// +optional
 	AllowedHeaders []string `json:"allowedHeaders,omitempty"`
+
+	// RequireConfirmation enables Human-in-the-Loop (HITL) for tools from this MCP server.
+	// When true, tool executions will require user confirmation before proceeding.
+	// +optional
+	RequireConfirmation bool `json:"requireConfirmation,omitempty"`
 }
 
 type TypedLocalReference struct {

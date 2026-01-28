@@ -212,6 +212,7 @@ export interface TypedLocalReference {
 
 export interface McpServerTool extends TypedLocalReference {
   toolNames: string[];
+  requireConfirmation?: boolean;
 }
 
 export type AgentType = "Declarative" | "BYO";

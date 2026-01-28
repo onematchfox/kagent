@@ -7,6 +7,13 @@ import (
 	"fmt"
 )
 
+// McpServerConfig contains common configuration for MCP servers
+type McpServerConfig struct {
+	Tools               []string `json:"tools"`
+	AllowedHeaders      []string `json:"allowed_headers,omitempty"`
+	RequireConfirmation *bool    `json:"require_confirmation,omitempty"`
+}
+
 type StreamableHTTPConnectionParams struct {
 	Url              string            `json:"url"`
 	Headers          map[string]string `json:"headers"`
@@ -16,9 +23,8 @@ type StreamableHTTPConnectionParams struct {
 }
 
 type HttpMcpServerConfig struct {
-	Params         StreamableHTTPConnectionParams `json:"params"`
-	Tools          []string                       `json:"tools"`
-	AllowedHeaders []string                       `json:"allowed_headers,omitempty"`
+	McpServerConfig
+	Params StreamableHTTPConnectionParams `json:"params"`
 }
 
 type SseConnectionParams struct {
@@ -29,9 +35,8 @@ type SseConnectionParams struct {
 }
 
 type SseMcpServerConfig struct {
-	Params         SseConnectionParams `json:"params"`
-	Tools          []string            `json:"tools"`
-	AllowedHeaders []string            `json:"allowed_headers,omitempty"`
+	McpServerConfig
+	Params SseConnectionParams `json:"params"`
 }
 
 type Model interface {

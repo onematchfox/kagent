@@ -1,4 +1,4 @@
-import { Message, TextPart } from "@a2a-js/sdk";
+import { Message, TextPart, DataPart } from "@a2a-js/sdk";
 import { TruncatableText } from "@/components/chat/TruncatableText";
 import ToolCallDisplay from "@/components/chat/ToolCallDisplay";
 import KagentLogo from "../kagent-logo";
@@ -8,6 +8,12 @@ import { FeedbackDialog } from "./FeedbackDialog";
 import { toast } from "sonner";
 import { convertToUserFriendlyName } from "@/lib/utils";
 import { ADKMetadata } from "@/lib/messageHandlers";
+import {
+  ToolDecisionType,
+  hasToolDecision,
+  hasFunctionCallOrResponse,
+  getToolApprovalInvocationIds,
+} from "@/lib/hitl";
 
 interface ChatMessageProps {
   message: Message;
@@ -16,15 +22,26 @@ interface ChatMessageProps {
     namespace: string;
     agentName: string;
   };
+  onToolDecision?: (toolId: string, decision: ToolDecisionType) => void;
+  decidedTools?: Map<string, ToolDecisionType>;
+  isStreaming?: boolean;
 }
 
-export default function ChatMessage({ message, allMessages, agentContext }: ChatMessageProps) {
+export default function ChatMessage({ 
+  message, 
+  allMessages, 
+  agentContext, 
+  onToolDecision,
+  decidedTools = new Map(),
+  isStreaming = false,
+}: ChatMessageProps) {
   const [feedbackDialogOpen, setFeedbackDialogOpen] = useState(false);
   const [isPositiveFeedback, setIsPositiveFeedback] = useState(true);
 
   const textParts = message.parts?.filter(part => part.kind === "text") || [];
   const content = textParts.map(part => (part as TextPart).text).join("");
 
+  const dataParts = message.parts?.filter(part => part.kind === "data") || [];
   const source = message.role === "user" ? "user" : "assistant";
   const messageId = message.messageId;
 
@@ -66,6 +83,30 @@ export default function ChatMessage({ message, allMessages, agentContext }: Chat
     return null;
   }
 
+  // Filter out user messages that contain tool_decisions (approval/deny responses)
+  // These are system messages for the HITL workflow, not user content
+  if (source === "user" && dataParts.some(part => {
+    const dataPart = part as DataPart;
+    return hasToolDecision(dataPart.data);
+  })) {
+    return null;
+  }
+
+  // Filter out intermediate agent text messages from HITL confirmation flows.
+  // These are text-only messages with the same invocation ID as a tool_approval message.
+  if (source !== "user" && content && allMessages) {
+    const messageMetadata = message.metadata as ADKMetadata;
+    const invocationId = messageMetadata?.kagent_invocation_id;
+    const isTextOnly = !hasFunctionCallOrResponse(dataParts as DataPart[]);
+
+    if (isTextOnly && invocationId) {
+      const toolApprovalInvocationIds = getToolApprovalInvocationIds(allMessages);
+      if (toolApprovalInvocationIds.has(invocationId)) {
+        return null;
+      }
+    }
+  }
+
   const metadata = message.metadata as ADKMetadata;
   const originalType = metadata?.originalType;
 
@@ -82,7 +123,15 @@ export default function ChatMessage({ message, allMessages, agentContext }: Chat
   const isStreamingToolCall = originalType === "ToolCallRequestEvent" || originalType === "ToolCallExecutionEvent";
 
   if (hasToolCallParts || isStreamingToolCall) {
-    return <ToolCallDisplay currentMessage={message} allMessages={allMessages} />;
+    return (
+      <ToolCallDisplay 
+        currentMessage={message} 
+        allMessages={allMessages}
+        onToolDecision={onToolDecision}
+        decidedTools={decidedTools}
+        isStreaming={isStreaming}
+      />
+    );
   }
 
   if (originalType === "ToolCallSummaryMessage") {
@@ -97,7 +146,15 @@ export default function ChatMessage({ message, allMessages, agentContext }: Chat
     });
 
     if (hasToolCalls) {
-      return <ToolCallDisplay currentMessage={message} allMessages={allMessages} />;
+      return (
+        <ToolCallDisplay 
+          currentMessage={message} 
+          allMessages={allMessages}
+          onToolDecision={onToolDecision}
+          decidedTools={decidedTools}
+          isStreaming={isStreaming}
+        />
+      );
     }
     return null;
   }

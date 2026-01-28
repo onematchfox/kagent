@@ -1,14 +1,39 @@
 import React, { useEffect, useMemo, useRef } from "react";
 import { Message, TextPart } from "@a2a-js/sdk";
 import ToolDisplay, { ToolCallStatus } from "@/components/ToolDisplay";
-import AgentCallDisplay from "@/components/chat/AgentCallDisplay";
+import AgentCallDisplay, { AgentCallStatus } from "@/components/chat/AgentCallDisplay";
 import { isAgentToolName } from "@/lib/utils";
 import { ADKMetadata, ProcessedToolResultData, ToolResponseData, normalizeToolResultToText } from "@/lib/messageHandlers";
 import { FunctionCall } from "@/types";
+import { ToolDecisionType, KAGENT_HITL_DECISION_TYPE_DENY, isToolApprovalInterrupt, ToolApprovalRequest } from "@/lib/hitl";
+
+// Convert ToolCallStatus to AgentCallStatus (pending_approval and denied don't apply to agent calls)
+const toAgentStatus = (status: ToolCallStatus): AgentCallStatus => {
+  if (status === "pending_approval") {
+    return "requested";
+  }
+  if (status === "denied") {
+    return "completed"; // Agent calls don't have denied state, treat as completed
+  }
+  return status;
+};
 
 interface ToolCallDisplayProps {
   currentMessage: Message;
   allMessages: Message[];
+  /** Called when user makes a decision on tool execution */
+  onToolDecision?: (toolId: string, decision: ToolDecisionType) => void;
+  /** Map of tool IDs to their decision (approve/deny) */
+  decidedTools?: Map<string, ToolDecisionType>;
+  /** Whether this is from an active streaming session (vs loaded from history) */
+  isStreaming?: boolean;
+}
+
+interface ConfirmationInfo {
+  id: string;
+  hint?: string;
+  /** True when backend is ready for user input (final input-required event received) */
+  awaitingInput?: boolean;
 }
 
 interface ToolCallState {
@@ -19,6 +44,10 @@ interface ToolCallState {
     is_error?: boolean;
   };
   status: ToolCallStatus;
+  /** Confirmation info if this tool is pending approval */
+  confirmationInfo?: ConfirmationInfo;
+  /** True when backend is ready for user input */
+  awaitingInput?: boolean;
 }
 
 // Create a global cache to track tool calls across components
@@ -151,7 +180,50 @@ const extractToolCallResults = (message: Message): ProcessedToolResultData[] => 
   }
 };
 
-const ToolCallDisplay = ({ currentMessage, allMessages }: ToolCallDisplayProps) => {
+// Extract confirmation requests from tool_approval interrupt data
+// Returns a map of original tool ID -> confirmation info
+const extractConfirmationRequests = (messages: Message[]): Map<string, ConfirmationInfo> => {
+  const confirmations = new Map<string, ConfirmationInfo>();
+  
+  for (const message of messages) {
+    // Check if this message has awaiting_input flag (set when final input-required event received)
+    const messageMetadata = message.metadata as Record<string, unknown> | undefined;
+    const awaitingInput = messageMetadata?.awaiting_input === true;
+    
+    // Check all data parts for tool_approval interrupt (generic format)
+    if (message.parts) {
+      for (const part of message.parts) {
+        if (part.kind === "data") {
+          const data = (part as { data?: unknown }).data;
+          if (isToolApprovalInterrupt(data)) {
+            // Generic format: { interrupt_type: "tool_approval", action_requests: [...] }
+            const actionRequests = data.action_requests as ToolApprovalRequest[];
+            for (const req of actionRequests) {
+              if (req.id) {
+                // Update existing entry if this message has awaitingInput flag
+                const existing = confirmations.get(req.id);
+                confirmations.set(req.id, {
+                  id: req.id,
+                  awaitingInput: awaitingInput || existing?.awaitingInput,
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  return confirmations;
+};
+
+const ToolCallDisplay = ({ 
+  currentMessage, 
+  allMessages,
+  onToolDecision,
+  decidedTools = new Map(),
+  isStreaming = false,
+}: ToolCallDisplayProps) => {
   // Track which call IDs this component instance registered in the cache
   const registeredIdsRef = useRef<Set<string>>(new Set());
 
@@ -189,6 +261,9 @@ const ToolCallDisplay = ({ currentMessage, allMessages }: ToolCallDisplayProps) 
     }
 
     const newToolCalls = new Map<string, ToolCallState>();
+    
+    // Extract all confirmation requests to apply to tool calls
+    const confirmationRequests = extractConfirmationRequests(allMessages);
 
     // First pass: collect all tool call requests that this component owns
     for (const message of allMessages) {
@@ -224,6 +299,11 @@ const ToolCallDisplay = ({ currentMessage, allMessages }: ToolCallDisplayProps) 
     }
 
     // Third pass: mark completed calls using summary messages
+    // We need to be careful here to avoid showing "Completed" before confirmation status arrives.
+    // Only auto-complete when:
+    // 1. A summary message exists (explicit completion signal), OR
+    // 2. Not streaming (loading from history)
+    // Even then, skip tools that have pending confirmations or decisions.
     let summaryMessageEncountered = false;
     for (const message of allMessages) {
       if (isToolCallSummaryMessage(message)) {
@@ -232,24 +312,62 @@ const ToolCallDisplay = ({ currentMessage, allMessages }: ToolCallDisplayProps) 
       }
     }
 
-    if (summaryMessageEncountered) {
+    // Only auto-complete if we have a summary message OR we're loading from history (not streaming)
+    // During active streaming without summary, tools stay in "executing" to avoid
+    // briefly showing "Completed" before a pending_approval status arrives
+    if (summaryMessageEncountered || !isStreaming) {
       newToolCalls.forEach((call, id) => {
         // Only update owned calls that are in 'executing' state and have a result
         if (call.status === "executing" && call.result && ownedCallIds.has(id)) {
-          call.status = "completed";
-        }
-      });
-    } else {
-      // For stored tasks without summary messages, auto-complete tool calls that have results
-      newToolCalls.forEach((call, id) => {
-        if (call.status === "executing" && call.result && ownedCallIds.has(id)) {
+          // Don't auto-complete if this tool has a pending confirmation or decision
+          // The fourth pass will set the correct status
+          const hasPendingConfirmation = confirmationRequests.has(id);
+          const hasDecision = decidedTools.has(id);
+          if (hasPendingConfirmation || hasDecision) {
+            // Skip - fourth pass will handle this
+            return;
+          }
           call.status = "completed";
         }
       });
     }
+    
+    // Fourth pass: apply pending_approval or denied status for tools with confirmation requests
+    confirmationRequests.forEach((confirmInfo, id) => {
+      if (newToolCalls.has(id)) {
+        const toolCall = newToolCalls.get(id)!;
+        
+        // Check if user has already made a decision for this tool
+        const decision = decidedTools.get(id);
+        
+        if (decision === KAGENT_HITL_DECISION_TYPE_DENY) {
+          // User denied this tool - show denied status
+          toolCall.status = "denied";
+          toolCall.confirmationInfo = undefined;
+          toolCall.awaitingInput = undefined;
+        } else if (decision) {
+          // User approved - if we have a result, show it; otherwise show executing
+          if (toolCall.result) {
+            toolCall.status = "completed";
+          } else {
+            toolCall.status = "executing";
+          }
+          toolCall.confirmationInfo = undefined;
+          toolCall.awaitingInput = undefined;
+        } else {
+          // No decision yet - show pending approval
+          toolCall.status = "pending_approval";
+          toolCall.confirmationInfo = confirmInfo;
+          // Track whether backend is ready for user input
+          toolCall.awaitingInput = confirmInfo.awaitingInput;
+          // Clear any stale result since the tool hasn't actually executed yet
+          toolCall.result = undefined;
+        }
+      }
+    });
 
     return newToolCalls;
-  }, [allMessages, ownedCallIds]);
+  }, [allMessages, ownedCallIds, decidedTools]);
 
   // If no tool calls to display for this message, return null
   const currentDisplayableCalls = Array.from(toolCalls.values()).filter(call => ownedCallIds.has(call.id));
@@ -263,7 +381,7 @@ const ToolCallDisplay = ({ currentMessage, allMessages }: ToolCallDisplayProps) 
             key={toolCall.id}
             call={toolCall.call}
             result={toolCall.result}
-            status={toolCall.status}
+            status={toAgentStatus(toolCall.status)}
             isError={toolCall.result?.is_error}
           />
         ) : (
@@ -273,6 +391,10 @@ const ToolCallDisplay = ({ currentMessage, allMessages }: ToolCallDisplayProps) 
             result={toolCall.result}
             status={toolCall.status}
             isError={toolCall.result?.is_error}
+            onDecision={onToolDecision}
+            confirmationHint={toolCall.confirmationInfo?.hint}
+            awaitingInput={toolCall.awaitingInput}
+            isStreaming={isStreaming}
           />
         )
       ))}

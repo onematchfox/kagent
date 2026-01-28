@@ -1,6 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { Plus, FunctionSquare, X } from "lucide-react";
+import { Plus, FunctionSquare, X, ShieldCheck } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useState, useEffect } from "react";
 import { isAgentTool, isMcpTool, getToolDescription, getToolIdentifier, getToolDisplayName, serverNamesMatch } from "@/lib/toolUtils";
@@ -9,6 +9,8 @@ import type { Tool, AgentResponse, ToolsResponse } from "@/types";
 import { getAgents } from "@/app/actions/agents";
 import { getTools } from "@/app/actions/tools";
 import KagentLogo from "../kagent-logo";
+import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 interface ToolsSectionProps {
   selectedTools: Tool[];
@@ -91,6 +93,22 @@ export const ToolsSection = ({ selectedTools, setSelectedTools, isSubmitting, on
     setSelectedTools(updatedTools);
   };
 
+  const handleToggleRequireConfirmation = (parentToolIdentifier: string) => {
+    const updatedTools = selectedTools.map(tool => {
+      if (getToolIdentifier(tool) === parentToolIdentifier && isMcpTool(tool)) {
+        return {
+          ...tool,
+          mcpServer: {
+            ...tool.mcpServer!,
+            requireConfirmation: !tool.mcpServer?.requireConfirmation,
+          },
+        };
+      }
+      return tool;
+    });
+    setSelectedTools(updatedTools);
+  };
+
   const renderSelectedTools = () => (
     <div className="space-y-2">
       {selectedTools.flatMap((agentTool: Tool) => {
@@ -98,7 +116,9 @@ export const ToolsSection = ({ selectedTools, setSelectedTools, isSubmitting, on
 
         if (isMcpTool(agentTool)) {
           const mcpTool = agentTool as Tool;
-          return mcpTool.mcpServer?.toolNames.map((mcpToolName: string) => {
+          const requiresConfirmation = mcpTool.mcpServer?.requireConfirmation || false;
+          
+          return mcpTool.mcpServer?.toolNames.map((mcpToolName: string, index: number) => {
             const toolIdentifierForDisplay = `${parentToolIdentifier}::${mcpToolName}`;
             
             // Show server name with namespace for consistency
@@ -138,7 +158,29 @@ export const ToolsSection = ({ selectedTools, setSelectedTools, isSubmitting, on
                         </div>
                       </div>
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-3">
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <div className="flex items-center gap-2">
+                              <ShieldCheck className={`h-4 w-4 ${requiresConfirmation ? 'text-amber-500' : 'text-muted-foreground'}`} />
+                              <Switch
+                                checked={requiresConfirmation}
+                                onCheckedChange={() => handleToggleRequireConfirmation(parentToolIdentifier)}
+                                disabled={isSubmitting}
+                                className="data-[state=checked]:bg-amber-500"
+                              />
+                            </div>
+                          </TooltipTrigger>
+                          <TooltipContent side="left">
+                            <p className="text-xs max-w-xs">
+                              {requiresConfirmation 
+                                ? "Human approval required before tool execution" 
+                                : "Enable to require human approval before executing this tool"}
+                            </p>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
                       <Button variant="ghost" size="sm" onClick={() => handleRemoveTool(parentToolIdentifier, mcpToolName)} disabled={isSubmitting}>
                         <X className="h-4 w-4" />
                       </Button>

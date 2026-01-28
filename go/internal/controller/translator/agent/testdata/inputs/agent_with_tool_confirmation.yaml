@@ -1,0 +1,78 @@
+operation: translateAgent
+targetObject: agent
+namespace: test
+objects:
+  - apiVersion: v1
+    kind: Secret
+    metadata:
+      name: openai-secret
+      namespace: test
+    data:
+      api-key: c2stdGVzdC1hcGkta2V5  # base64 encoded "sk-test-api-key"
+  - apiVersion: kagent.dev/v1alpha2
+    kind: ModelConfig
+    metadata:
+      name: test-model
+      namespace: test
+    spec:
+      provider: OpenAI
+      model: gpt-4o
+      apiKeySecret: openai-secret
+      apiKeySecretKey: api-key
+  - apiVersion: kagent.dev/v1alpha2
+    kind: Agent
+    metadata:
+      name: agent
+      namespace: test
+    spec:
+      type: Declarative
+      declarative:
+        description: An agent with HITL tool confirmation
+        systemMessage: You are a helpful assistant with tools that require human approval.
+        modelConfig: test-model
+        tools:
+          - type: MCPServer
+            mcpServer:
+              name: toolserver
+              kind: Service
+              toolNames:
+                - dangerous_tool
+                - another_tool
+              requireConfirmation: true
+          - type: MCPServer
+            mcpServer:
+              name: safe-toolserver
+              kind: Service
+              toolNames:
+                - safe_tool
+              requireConfirmation: false
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: toolserver
+      annotations:
+        kagent.dev/mcp-service-protocol: "sse"
+        kagent.dev/mcp-service-path: "/mcp"
+      namespace: test
+    spec:
+      ports:
+      - name: mcp
+        port: 8084
+        targetPort: 8084
+        protocol: TCP
+        appProtocol: mcp
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: safe-toolserver
+      annotations:
+        kagent.dev/mcp-service-protocol: "streamable-http"
+        kagent.dev/mcp-service-path: "/mcp"
+      namespace: test
+    spec:
+      ports:
+      - name: mcp
+        port: 8085
+        targetPort: 8085
+        protocol: TCP
+        appProtocol: mcp

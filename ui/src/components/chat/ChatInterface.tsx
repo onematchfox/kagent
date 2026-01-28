@@ -1,8 +1,8 @@
 "use client";
 
 import type React from "react";
-import { useState, useRef, useEffect } from "react";
-import { ArrowBigUp, X, Loader2, Mic, Square } from "lucide-react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { ArrowBigUp, X, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -27,6 +27,11 @@ import { kagentA2AClient } from "@/lib/a2aClient";
 import { v4 as uuidv4 } from "uuid";
 import { getStatusPlaceholder } from "@/lib/statusUtils";
 import { Message } from "@a2a-js/sdk";
+import {
+  ToolDecisionType,
+  KAGENT_HITL_DECISION_TYPE_APPROVE,
+  extractToolDecisionsFromMessages,
+} from "@/lib/hitl";
 
 interface ChatInterfaceProps {
   selectedAgentName: string;
@@ -58,6 +63,13 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
   const [sessionNotFound, setSessionNotFound] = useState<boolean>(false);
   const isCreatingSessionRef = useRef<boolean>(false);
   const [isFirstMessage, setIsFirstMessage] = useState<boolean>(!sessionId);
+  const [decidedTools, setDecidedTools] = useState<Map<string, ToolDecisionType>>(new Map());
+
+  // Combined messages for tool call display - allows historical tools to see streaming results
+  const allMessages = useMemo(
+    () => [...storedMessages, ...streamingMessages],
+    [storedMessages, streamingMessages]
+  );
 
   const {
     isListening,
@@ -86,6 +98,104 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
     }
   });
 
+  const handleToolDecision = useCallback(async (toolId: string, decision: ToolDecisionType) => {
+    const currentSessionId = session?.id || sessionId;
+    if (!currentSessionId) {
+      toast.error("No session available for approval");
+      return;
+    }
+
+    setDecidedTools(prev => new Map(prev).set(toolId, decision));
+    setChatStatus("thinking");
+
+    try {
+      // Find the current task ID from messages - needed to resume the task
+      // The task in input_required state has a taskId that we must include
+      const allMessages = [...storedMessages, ...streamingMessages];
+      const currentTaskId = allMessages
+        .filter(m => m.taskId)
+        .map(m => m.taskId)
+        .pop(); // Get the most recent taskId
+
+      // Create the decision message with a single tool decision
+      const decisionSummary = `${toolId}: ${decision}`;
+      const messageId = uuidv4();
+      const decisionMessage: Message = {
+        kind: "message",
+        messageId,
+        role: "user",
+        contextId: currentSessionId,
+        taskId: currentTaskId,
+        parts: [
+          {
+            kind: "data",
+            data: {
+              decision_type: decision,
+              tool_id: toolId,
+            },
+          },
+          {
+            kind: "text",
+            text: decisionSummary,
+          },
+        ],
+      };
+
+      abortControllerRef.current = new AbortController();
+
+      const sendParams = {
+        message: decisionMessage,
+        metadata: {}
+      };
+
+      const stream = await kagentA2AClient.sendMessageStream(
+        selectedNamespace,
+        selectedAgentName,
+        sendParams,
+        abortControllerRef.current?.signal
+      );
+
+      let timeoutTimer: NodeJS.Timeout | null = null;
+      let streamActive = true;
+      const streamTimeout = 600000; // 10 minutes
+
+      const handleTimeout = () => {
+        if (streamActive) {
+          console.error("Stream timeout - no events received for 10 minutes");
+          toast.error("Stream timed out");
+          streamActive = false;
+          if (abortControllerRef.current) abortControllerRef.current.abort();
+        }
+      };
+
+      const startTimeout = () => {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        timeoutTimer = setTimeout(handleTimeout, streamTimeout);
+      };
+      startTimeout();
+
+      try {
+        for await (const event of stream) {
+          startTimeout();
+          try {
+            handleMessageEvent(event);
+          } catch (error) {
+            console.error(`Error handling event: ${error}`);
+          }
+          if (abortControllerRef.current?.signal.aborted) {
+            streamActive = false;
+            break;
+          }
+        }
+      } finally {
+        streamActive = false;
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+      }
+    } finally {
+      // Don't set to ready - let the event stream determine the final status
+    }
+  }, [session?.id, sessionId, selectedNamespace, selectedAgentName, handleMessageEvent, storedMessages, streamingMessages]);
+
   useEffect(() => {
     async function initializeChat() {
       setTokenStats({ total: 0, input: 0, output: 0 });
@@ -100,6 +210,7 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
       if (!sessionId) {
         setIsLoading(false);
         setStoredMessages([]);
+        setDecidedTools(new Map());
         return;
       }
 
@@ -123,12 +234,15 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
         if (!messagesResponse.data || messagesResponse?.data?.length === 0) {
           setStoredMessages([]);
           setTokenStats({ total: 0, input: 0, output: 0 });
+          setDecidedTools(new Map());
         }
         else {
           const extractedMessages = extractMessagesFromTasks(messagesResponse.data);
           const extractedTokenStats = extractTokenStatsFromTasks(messagesResponse.data);
+          const extractedDecisions = extractToolDecisionsFromMessages(extractedMessages);
           setStoredMessages(extractedMessages);
           setTokenStats(extractedTokenStats);
+          setDecidedTools(extractedDecisions);
         }
       } catch (error) {
         console.error("Error loading messages:", error);
@@ -388,11 +502,14 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
                   return <ChatMessage
                     key={`stored-${index}`}
                     message={message}
-                    allMessages={storedMessages}
+                    allMessages={allMessages}
                     agentContext={{
                       namespace: selectedNamespace,
                       agentName: selectedAgentName
                     }}
+                    onToolDecision={handleToolDecision}
+                    decidedTools={decidedTools}
+                    isStreaming={isStreaming}
                   />
                 })}
 
@@ -401,11 +518,14 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
                   return <ChatMessage
                     key={`stream-${index}`}
                     message={message}
-                    allMessages={streamingMessages}
+                    allMessages={allMessages}
                     agentContext={{
                       namespace: selectedNamespace,
                       agentName: selectedAgentName
                     }}
+                    onToolDecision={handleToolDecision}
+                    decidedTools={decidedTools}
+                    isStreaming={isStreaming}
                   />
                 })}
 

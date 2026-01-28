@@ -17,6 +17,7 @@ from kagent.core.a2a import (
     A2A_DATA_PART_METADATA_IS_LONG_RUNNING_KEY,
     A2A_DATA_PART_METADATA_TYPE_FUNCTION_CALL,
     A2A_DATA_PART_METADATA_TYPE_KEY,
+    KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL,
     get_kagent_metadata_key,
 )
 
@@ -166,9 +167,12 @@ def convert_event_to_a2a_message(
                 _process_long_running_tool(a2a_part, event)
 
         if a2a_parts:
-            # Include adk_partial in message metadata so TaskStore can filter
-            # partial streaming messages from history before saving
-            message_metadata = {"adk_partial": event.partial}
+            # Include metadata for filtering:
+            # - adk_partial: for filtering partial streaming messages
+            # - kagent_invocation_id: for filtering intermediate HITL messages
+            message_metadata: dict[str, Any] = {"adk_partial": event.partial}
+            if event.invocation_id:
+                message_metadata[get_kagent_metadata_key("invocation_id")] = event.invocation_id
             return Message(message_id=str(uuid.uuid4()), role=role, parts=a2a_parts, metadata=message_metadata)
 
     except Exception as e:
@@ -265,6 +269,14 @@ def _create_status_update_event(
         for part in message.parts
         if part.root.metadata
     ):
+        status.state = TaskState.input_required
+    elif any(
+        part.root.metadata.get(get_kagent_metadata_key(A2A_DATA_PART_METADATA_TYPE_KEY))
+        == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
+        for part in message.parts
+        if part.root.metadata
+    ):
+        # Tool approval interrupts always require user input
         status.state = TaskState.input_required
 
     return TaskStatusUpdateEvent(

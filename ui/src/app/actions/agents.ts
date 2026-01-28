@@ -58,6 +58,7 @@ function fromAgentFormDataToAgent(agentFormData: AgentFormData): Agent {
             kind,
             apiGroup: mcpServer.apiGroup,
             toolNames: mcpServer.toolNames,
+            requireConfirmation: mcpServer.requireConfirmation,
           },
         } as Tool;
       }

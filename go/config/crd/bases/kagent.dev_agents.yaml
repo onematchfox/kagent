@@ -9982,6 +9982,11 @@ spec:
                               type: string
                             namespace:
                               type: string
+                            requireConfirmation:
+                              description: |-
+                                RequireConfirmation enables Human-in-the-Loop (HITL) for tools from this MCP server.
+                                When true, tool executions will require user confirmation before proceeding.
+                              type: boolean
                             toolNames:
                               description: |-
                                 The names of the tools to be provided by the ToolServer

@@ -39,12 +39,14 @@ func main() {
 		c.Close()
 		cfg.HttpTools = []adk.HttpMcpServerConfig{
 			{
+				McpServerConfig: adk.McpServerConfig{
+					Tools: []string{},
+				},
 				Params: adk.StreamableHTTPConnectionParams{
 					Url:     "http://127.0.0.1:3001/mcp",
 					Headers: map[string]string{},
 					Timeout: ptrTo(30.0),
 				},
-				Tools: []string{},
 			},
 		}
 	}

@@ -291,8 +291,10 @@ class LangGraphAgentExecutor(AgentExecutor):
         event_queue: EventQueue,
     ) -> None:
         """Resume graph execution after interrupt with user decision."""
-        # Extract decision from message using core utility
-        decision_type = extract_decision_from_message(context.message)
+        # Extract decision from message using core utility.
+        # LangGraph doesn't use tool_id (handles all tools at once).
+        tool_decision = extract_decision_from_message(context.message)
+        decision_type = tool_decision.decision_type if tool_decision else None
 
         if not decision_type:
             # Security: Default to deny if decision cannot be determined

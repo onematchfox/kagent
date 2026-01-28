@@ -32,10 +32,14 @@ from kagent.core.a2a import (
     A2A_DATA_PART_METADATA_TYPE_FUNCTION_CALL,
     A2A_DATA_PART_METADATA_TYPE_FUNCTION_RESPONSE,
     A2A_DATA_PART_METADATA_TYPE_KEY,
+    KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL,
     get_kagent_metadata_key,
 )
 
 logger = logging.getLogger("kagent_adk." + __name__)
+
+# ADK's function name for confirmation requests
+ADK_REQUEST_CONFIRMATION_NAME = "adk_request_confirmation"
 
 
 def convert_a2a_part_to_genai_part(
@@ -154,6 +158,39 @@ def convert_genai_part_to_a2a_part(
     # TODO once A2A defined how to suervice such information, migrate below
     # logic accordinlgy
     if part.function_call:
+        # Check if this is ADK's adk_request_confirmation - convert to KAgent HITL event
+        if part.function_call.name == ADK_REQUEST_CONFIRMATION_NAME:
+            # Extract the original function call from args
+            args = part.function_call.args or {}
+            original_call = args.get("originalFunctionCall", {})
+
+            # Convert to generic tool approval format
+            # - action_requests[].id = original tool call ID (for UI matching)
+            # - action_requests[].metadata = framework-specific data (ADK stores confirmation_id here)
+            return a2a_types.Part(
+                root=a2a_types.DataPart(
+                    data={
+                        "interrupt_type": KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL,
+                        "action_requests": [
+                            {
+                                "name": original_call.get("name", ""),
+                                "args": original_call.get("args", {}),
+                                "id": original_call.get("id"),
+                                "metadata": {
+                                    "confirmation_id": part.function_call.id,
+                                },
+                            }
+                        ],
+                    },
+                    metadata={
+                        get_kagent_metadata_key(
+                            A2A_DATA_PART_METADATA_TYPE_KEY
+                        ): KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
+                    },
+                )
+            )
+
+        # Regular function call - pass through as-is
         return a2a_types.Part(
             root=a2a_types.DataPart(
                 data=part.function_call.model_dump(by_alias=True, exclude_none=True),
@@ -164,6 +201,16 @@ def convert_genai_part_to_a2a_part(
         )
 
     if part.function_response:
+        # Filter out "fake" function_response that ADK sends when tool requires
+        # confirmation This prevents the tool from briefly showing as
+        # "completed" before the approval UI appears.
+        response = part.function_response.response
+        if isinstance(response, dict) and "error" in response:
+            error_msg = response.get("error", "")
+            if "requires confirmation" in str(error_msg).lower():
+                logger.debug("Filtering out confirmation placeholder function_response")
+                return None
+
         return a2a_types.Part(
             root=a2a_types.DataPart(
                 data=part.function_response.model_dump(by_alias=True, exclude_none=True),
