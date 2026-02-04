@@ -138,6 +138,10 @@ func (h *SessionsHandler) HandleCreateSession(w ErrorResponseWriter, r *http.Req
 		AgentID: &agent.ID,
 	}
 
+	if sessionRequest.State != nil {
+		session.State = *sessionRequest.State
+	}
+
 	log.V(1).Info("Creating session in database",
 		"agentRef", sessionRequest.AgentRef,
 		"name", sessionRequest.Name)

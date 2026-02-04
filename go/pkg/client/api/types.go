@@ -103,6 +103,8 @@ type SessionRequest struct {
 	AgentRef *string `json:"agent_ref,omitempty"`
 	Name     *string `json:"name,omitempty"`
 	ID       *string `json:"id,omitempty"`
+	// State is optional JSON-serialized session state for cross-request persistence (e.g. pending child HITL).
+	State *string `json:"state,omitempty"`
 }
 
 // Run types

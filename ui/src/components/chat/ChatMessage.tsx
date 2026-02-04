@@ -10,6 +10,7 @@ import { convertToUserFriendlyName } from "@/lib/utils";
 import { ADKMetadata } from "@/lib/messageHandlers";
 import {
   ToolDecisionType,
+  type ToolDecisionChildContext,
   hasToolDecision,
   hasFunctionCallOrResponse,
   getToolApprovalInvocationIds,
@@ -22,7 +23,7 @@ interface ChatMessageProps {
     namespace: string;
     agentName: string;
   };
-  onToolDecision?: (toolId: string, decision: ToolDecisionType) => void;
+  onToolDecision?: (toolId: string, decision: ToolDecisionType, childContext?: ToolDecisionChildContext) => void;
   decidedTools?: Map<string, ToolDecisionType>;
   isStreaming?: boolean;
 }

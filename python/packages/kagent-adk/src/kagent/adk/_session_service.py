@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any, Optional
 
@@ -42,6 +43,8 @@ class KAgentSessionService(BaseSessionService):
             request_data["id"] = session_id
         if state and state.get("session_name"):
             request_data["name"] = state.get("session_name", "")
+        if state is not None and state:
+            request_data["state"] = json.dumps(state)
 
         # Make API call to create session
         response = await self.client.post(
@@ -108,12 +111,25 @@ class KAgentSessionService(BaseSessionService):
                 events.append(Event.model_validate_json(event_data["data"]))
 
             # Convert to ADK Session format
+            # Restore full session state from the API (persisted so any pod can serve the next request)
+            state: dict[str, Any] = {}
+            raw_state = session_data.get("state")
+            if raw_state and isinstance(raw_state, str) and raw_state.strip():
+                try:
+                    state = json.loads(raw_state)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if not isinstance(state, dict):
+                state = {}
+            if session_data.get("name") and "session_name" not in state:
+                state["session_name"] = session_data["name"]
+
             session = Session(
                 id=session_data["id"],
                 user_id=session_data["user_id"],
                 events=events,
                 app_name=app_name,
-                state={},
+                state=state,
             )
 
             for event in events:

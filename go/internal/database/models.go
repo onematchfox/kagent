@@ -64,6 +64,8 @@ type Session struct {
 	DeletedAt gorm.DeletedAt `gorm:"index" json:"deleted_at"`
 
 	AgentID *string `gorm:"index" json:"agent_id"`
+	// State is optional JSON-serialized session state (e.g. pending child HITL context) for cross-request persistence.
+	State string `gorm:"type:text" json:"state,omitempty"`
 }
 
 type Task struct {

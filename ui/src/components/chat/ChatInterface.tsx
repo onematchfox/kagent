@@ -29,8 +29,8 @@ import { getStatusPlaceholder } from "@/lib/statusUtils";
 import { Message } from "@a2a-js/sdk";
 import {
   ToolDecisionType,
-  KAGENT_HITL_DECISION_TYPE_APPROVE,
   extractToolDecisionsFromMessages,
+  type ToolDecisionChildContext,
 } from "@/lib/hitl";
 
 interface ChatInterfaceProps {
@@ -98,27 +98,50 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
     }
   });
 
-  const handleToolDecision = useCallback(async (toolId: string, decision: ToolDecisionType) => {
+  // Unified handler for direct tool approval and child agent tool approval (multi-agent HITL).
+  // When childContext is provided, the decision is for a child agent's tool (use parentCallId for UI keying).
+  const handleToolDecision = useCallback(async (
+    toolId: string,
+    decision: ToolDecisionType,
+    childContext?: ToolDecisionChildContext
+  ) => {
     const currentSessionId = session?.id || sessionId;
     if (!currentSessionId) {
       toast.error("No session available for approval");
       return;
     }
 
-    setDecidedTools(prev => new Map(prev).set(toolId, decision));
+    const decidedToolsKey = childContext?.parentCallId ?? toolId;
+    setIsStreaming(true);
+    setDecidedTools(prev => new Map(prev).set(decidedToolsKey, decision));
     setChatStatus("thinking");
 
     try {
-      // Find the current task ID from messages - needed to resume the task
-      // The task in input_required state has a taskId that we must include
       const allMessages = [...storedMessages, ...streamingMessages];
       const currentTaskId = allMessages
         .filter(m => m.taskId)
         .map(m => m.taskId)
-        .pop(); // Get the most recent taskId
+        .pop();
 
-      // Create the decision message with a single tool decision
-      const decisionSummary = `${toolId}: ${decision}`;
+      const dataPart: Record<string, unknown> = {
+        decision_type: decision,
+        tool_id: toolId,
+      };
+      if (childContext) {
+        dataPart.child_agent_name = childContext.childAgentName;
+        dataPart.parent_call_id = childContext.parentCallId;
+      }
+
+      let decisionText: string;
+      if (childContext) {
+        const friendlyAgentName = childContext.childAgentName.replace(/^kagent__NS__/, "").replace(/_/g, " ");
+        decisionText = decision === "approve"
+          ? `I approve the tool execution for the ${friendlyAgentName} agent. Please proceed with the delegation.`
+          : `I deny the tool execution for the ${friendlyAgentName} agent. Do not proceed.`;
+      } else {
+        decisionText = `${toolId}: ${decision}`;
+      }
+
       const messageId = uuidv4();
       const decisionMessage: Message = {
         kind: "message",
@@ -127,38 +150,22 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
         contextId: currentSessionId,
         taskId: currentTaskId,
         parts: [
-          {
-            kind: "data",
-            data: {
-              decision_type: decision,
-              tool_id: toolId,
-            },
-          },
-          {
-            kind: "text",
-            text: decisionSummary,
-          },
+          { kind: "data", data: dataPart },
+          { kind: "text", text: decisionText },
         ],
       };
 
       abortControllerRef.current = new AbortController();
-
-      const sendParams = {
-        message: decisionMessage,
-        metadata: {}
-      };
-
       const stream = await kagentA2AClient.sendMessageStream(
         selectedNamespace,
         selectedAgentName,
-        sendParams,
+        { message: decisionMessage, metadata: {} },
         abortControllerRef.current?.signal
       );
 
       let timeoutTimer: NodeJS.Timeout | null = null;
       let streamActive = true;
       const streamTimeout = 600000; // 10 minutes
-
       const handleTimeout = () => {
         if (streamActive) {
           console.error("Stream timeout - no events received for 10 minutes");
@@ -167,7 +174,6 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
           if (abortControllerRef.current) abortControllerRef.current.abort();
         }
       };
-
       const startTimeout = () => {
         if (timeoutTimer) clearTimeout(timeoutTimer);
         timeoutTimer = setTimeout(handleTimeout, streamTimeout);
@@ -191,8 +197,8 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
         streamActive = false;
         if (timeoutTimer) clearTimeout(timeoutTimer);
       }
-    } finally {
-      // Don't set to ready - let the event stream determine the final status
+    } catch {
+      // Let the event stream determine the final status
     }
   }, [session?.id, sessionId, selectedNamespace, selectedAgentName, handleMessageEvent, storedMessages, streamingMessages]);
 

@@ -14,6 +14,7 @@ from google.adk.flows.llm_flows.functions import REQUEST_EUC_FUNCTION_CALL_NAME
 from google.genai import types as genai_types
 
 from kagent.core.a2a import (
+    A2A_DATA_PART_METADATA_CONTAINS_TOOL_APPROVAL_KEY,
     A2A_DATA_PART_METADATA_IS_LONG_RUNNING_KEY,
     A2A_DATA_PART_METADATA_TYPE_FUNCTION_CALL,
     A2A_DATA_PART_METADATA_TYPE_KEY,
@@ -135,7 +136,11 @@ def _process_long_running_tool(a2a_part: A2APart, event: Event) -> None:
 
 
 def convert_event_to_a2a_message(
-    event: Event, invocation_context: InvocationContext, role: Role = Role.agent
+    event: Event,
+    invocation_context: InvocationContext,
+    role: Role = Role.agent,
+    context_id: Optional[str] = None,
+    task_id: Optional[str] = None,
 ) -> Optional[Message]:
     """Converts an ADK event to an A2A message.
 
@@ -143,6 +148,8 @@ def convert_event_to_a2a_message(
       event: The ADK event to convert.
       invocation_context: The invocation context.
       role: The role attribute for the message (default: Role.agent).
+      context_id: Optional A2A context ID (for multi-agent HITL forwarding).
+      task_id: Optional A2A task ID (for multi-agent HITL forwarding).
 
     Returns:
       An A2A Message if the event has content, None otherwise.
@@ -161,7 +168,7 @@ def convert_event_to_a2a_message(
     try:
         a2a_parts = []
         for part in event.content.parts:
-            a2a_part = convert_genai_part_to_a2a_part(part)
+            a2a_part = convert_genai_part_to_a2a_part(part, context_id, task_id)
             if a2a_part:
                 a2a_parts.append(a2a_part)
                 _process_long_running_tool(a2a_part, event)
@@ -262,14 +269,10 @@ def _create_status_update_event(
         if part.root.metadata
     ):
         status.state = TaskState.auth_required
-    elif any(
-        part.root.metadata.get(get_kagent_metadata_key(A2A_DATA_PART_METADATA_TYPE_KEY))
-        == A2A_DATA_PART_METADATA_TYPE_FUNCTION_CALL
-        and part.root.metadata.get(get_kagent_metadata_key(A2A_DATA_PART_METADATA_IS_LONG_RUNNING_KEY)) is True
-        for part in message.parts
-        if part.root.metadata
-    ):
-        status.state = TaskState.input_required
+    # NOTE: We intentionally do NOT set input_required for generic long-running
+    # function calls here. Setting it prematurely would cause the runner loop to
+    # break before the tool runs and calls request_confirmation(). The tool_approval
+    # event (below) is what actually indicates user input is needed.
     elif any(
         part.root.metadata.get(get_kagent_metadata_key(A2A_DATA_PART_METADATA_TYPE_KEY))
         == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
@@ -277,6 +280,13 @@ def _create_status_update_event(
         if part.root.metadata
     ):
         # Tool approval interrupts always require user input
+        status.state = TaskState.input_required
+    elif any(
+        part.root.metadata.get(get_kagent_metadata_key(A2A_DATA_PART_METADATA_CONTAINS_TOOL_APPROVAL_KEY)) is True
+        for part in message.parts
+        if part.root.metadata
+    ):
+        # Tool approval in function_response (child or same-agent) requires user input
         status.state = TaskState.input_required
 
     return TaskStatusUpdateEvent(
@@ -322,7 +332,8 @@ def convert_event_to_a2a_events(
             a2a_events.append(error_event)
 
         # Handle regular message content
-        message = convert_event_to_a2a_message(event, invocation_context)
+        # Pass context_id and task_id so HITL events can include them for multi-agent forwarding
+        message = convert_event_to_a2a_message(event, invocation_context, context_id=context_id, task_id=task_id)
         if message:
             running_event = _create_status_update_event(message, invocation_context, event, task_id, context_id)
             a2a_events.append(running_event)

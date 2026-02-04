@@ -52,10 +52,12 @@ class ToolDecision:
     Attributes:
         decision_type: The type of decision (approve, deny, reject)
         tool_id: The ID of the tool to which the decision applies, or None if the decision applies to all tools
+        child_agent_name: For multi-agent HITL, the name of the child agent whose tool needs the decision
     """
 
     decision_type: DecisionType
     tool_id: str | None
+    child_agent_name: str | None = None
 
 
 @dataclass
@@ -123,9 +125,10 @@ def _is_valid_decision(decision: str | None) -> bool:
 def extract_decision_from_data_part(data: dict) -> ToolDecision | None:
     """Extract decision from structured DataPart.
 
-    Supports two formats using the same decision_type key:
+    Supports several formats using the same decision_type key:
     1. Global format: {decision_type: "approve"} - applies to all tools
     2. Per-tool format: {decision_type: "approve", tool_id: "call_123"} - specific tool
+    3. Child agent format: {decision_type: "approve", tool_id: "...", child_agent_name: "agent"} - child agent's tool
 
     Args:
         data: DataPart.data dictionary
@@ -133,12 +136,17 @@ def extract_decision_from_data_part(data: dict) -> ToolDecision | None:
     Returns:
         ToolDecision if found and valid, None otherwise.
         tool_id is None for global decisions.
+        child_agent_name is set when the decision is for a child agent's tool.
     """
     decision = data.get(KAGENT_HITL_DECISION_TYPE_KEY)
     if not _is_valid_decision(decision):
         return None
 
-    return ToolDecision(decision_type=decision, tool_id=data.get("tool_id"))
+    return ToolDecision(
+        decision_type=decision,
+        tool_id=data.get("tool_id"),
+        child_agent_name=data.get("child_agent_name"),
+    )
 
 
 def extract_decision_from_text(text: str) -> DecisionType | None:

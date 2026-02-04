@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import { convertToUserFriendlyName, messageUtils } from "@/lib/utils";
 import { TokenStats, ChatStatus } from "@/types";
 import { mapA2AStateToStatus } from "@/lib/statusUtils";
-import { isToolApprovalInterrupt, KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL } from "@/lib/hitl";
+import { hasToolApprovalRequest } from "@/lib/hitl";
 
 // Helper functions for extracting data from stored tasks
 export function extractMessagesFromTasks(tasks: Task[]): Message[] {
@@ -70,6 +70,7 @@ export interface ADKMetadata {
   kagent_type?: "function_call" | "function_response";
   kagent_author?: string;
   kagent_invocation_id?: string;
+  kagent_contains_tool_approval?: boolean;
   originalType?: OriginalMessageType;
   displaySource?: string;
   toolCallData?: ProcessedToolCallData[];
@@ -337,15 +338,7 @@ export const createMessageHandlers = (handlers: MessageHandlers) => {
         }
 
         // Check for tool approval interrupt (HITL) - preserve the full message for the approval UI
-        // Backend converts framework-specific formats to the generic interrupt_type/action_requests format
-        const hasToolApprovalData = message.parts?.some(part => {
-          if (isDataPart(part)) {
-            return isToolApprovalInterrupt(part.data);
-          }
-          return false;
-        });
-
-        if (hasToolApprovalData && statusUpdate.status.state === "input-required") {
+        if (hasToolApprovalRequest(message) && statusUpdate.status.state === "input-required") {
           const messageWithInputFlag = {
             ...message,
             metadata: {

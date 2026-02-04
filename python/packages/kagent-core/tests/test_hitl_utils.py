@@ -575,3 +575,54 @@ class TestFindPendingToolRequest:
         # History tool shouldn't be found since status has requests
         result = find_pending_tool_request(task, "call_history")
         assert result is None
+
+
+def test_extract_decision_with_child_agent_name():
+    """Test extracting a decision that includes child_agent_name for multi-agent HITL."""
+    message = Message(
+        role="user",
+        message_id="test",
+        task_id="task1",
+        context_id="ctx1",
+        parts=[
+            Part(
+                DataPart(
+                    data={
+                        KAGENT_HITL_DECISION_TYPE_KEY: KAGENT_HITL_DECISION_TYPE_APPROVE,
+                        "tool_id": "call_child_123",
+                        "child_agent_name": "kagent__NS__querydoc",
+                    }
+                )
+            )
+        ],
+    )
+    result = extract_decision_from_message(message)
+    assert result is not None
+    assert result.decision_type == KAGENT_HITL_DECISION_TYPE_APPROVE
+    assert result.tool_id == "call_child_123"
+    assert result.child_agent_name == "kagent__NS__querydoc"
+
+
+def test_extract_decision_without_child_agent_name():
+    """Test that decisions without child_agent_name have it set to None."""
+    message = Message(
+        role="user",
+        message_id="test",
+        task_id="task1",
+        context_id="ctx1",
+        parts=[
+            Part(
+                DataPart(
+                    data={
+                        KAGENT_HITL_DECISION_TYPE_KEY: KAGENT_HITL_DECISION_TYPE_DENY,
+                        "tool_id": "call_456",
+                    }
+                )
+            )
+        ],
+    )
+    result = extract_decision_from_message(message)
+    assert result is not None
+    assert result.decision_type == KAGENT_HITL_DECISION_TYPE_DENY
+    assert result.tool_id == "call_456"
+    assert result.child_agent_name is None

@@ -10,6 +10,10 @@
 // Interrupt type for tool approval requests
 export const KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL = "tool_approval";
 
+// Part metadata key set by backend when a function_response contains tool_approval
+// (enables input_required without parsing content). Value from get_kagent_metadata_key("contains_tool_approval").
+export const KAGENT_METADATA_CONTAINS_TOOL_APPROVAL = "kagent_contains_tool_approval";
+
 // Decision type key in DataPart
 export const KAGENT_HITL_DECISION_TYPE_KEY = "decision_type";
 
@@ -34,6 +38,12 @@ export interface ToolApprovalInterruptData {
 
 // Type for per-tool decisions
 export type ToolDecisionType = typeof KAGENT_HITL_DECISION_TYPE_APPROVE | typeof KAGENT_HITL_DECISION_TYPE_DENY;
+
+// Optional context when the decision is for a child agent's tool (multi-agent HITL)
+export interface ToolDecisionChildContext {
+  childAgentName: string;
+  parentCallId: string;
+}
 
 // Type for a tool decision sent back to the backend
 export interface ToolDecision {
@@ -85,7 +95,11 @@ export function extractToolDecisionsFromMessages(messages: Array<{ role?: string
     
     for (const part of message.parts) {
       if (part.kind === "data" && hasToolDecision(part.data) && part.data.tool_id) {
-        decisions.set(part.data.tool_id, part.data.decision_type);
+        // For child agent HITL, use parent_call_id as key (if available)
+        // This matches how decidedTools is keyed in the UI
+        const data = part.data as { parent_call_id?: string; tool_id: string; decision_type: ToolDecisionType };
+        const key = data.parent_call_id || data.tool_id;
+        decisions.set(key, data.decision_type);
       }
     }
   }
@@ -100,12 +114,36 @@ type MessageWithParts = {
 };
 
 /**
- * Check if a message contains a tool approval request
+ * Get the tool call ID that needs confirmation from a single part, or null.
+ * We approve one tool at a time; direct format has action_requests array but we use the first.
+ */
+export function getToolApprovalIdFromPart(
+  part: { kind: string; data?: unknown; metadata?: unknown }
+): string | null {
+  if (part.kind !== "data" || !part.data) return null;
+  const data = part.data as Record<string, unknown>;
+
+  // Direct format: { interrupt_type: "tool_approval", action_requests: [...] }
+  if (isToolApprovalInterrupt(data)) {
+    const requests = (data.action_requests as ToolApprovalRequest[]) ?? [];
+    const first = requests[0]?.id;
+    return first ?? null;
+  }
+
+  // Wrapped format: backend sets contains_tool_approval when response has tool approval
+  const responseData = data as { id?: string; response?: { result?: unknown } };
+  if (responseData?.id && responseData?.response?.result) {
+    const meta = part.metadata as Record<string, unknown> | undefined;
+    if (meta?.[KAGENT_METADATA_CONTAINS_TOOL_APPROVAL] === true) return responseData.id;
+  }
+  return null;
+}
+
+/**
+ * Check if a message contains a tool approval request.
  */
 export function hasToolApprovalRequest(msg: MessageWithParts): boolean {
-  return msg.parts?.some(part => 
-    part.kind === "data" && isToolApprovalInterrupt(part.data)
-  ) ?? false;
+  return msg.parts?.some((part) => getToolApprovalIdFromPart(part) !== null) ?? false;
 }
 
 /**
@@ -133,4 +171,35 @@ export function getToolApprovalInvocationIds(messages: MessageWithParts[]): Set<
     }
   }
   return ids;
+}
+
+/**
+ * Try to parse tool_approval interrupt data from a string (e.g., AgentTool output).
+ * Returns null if the string doesn't contain valid tool_approval data.
+ */
+export function parseToolApprovalFromString(content: string): ToolApprovalInterruptData | null {
+  if (!content) return null;
+  
+  try {
+    // Try direct JSON parse
+    const parsed = JSON.parse(content);
+    if (isToolApprovalInterrupt(parsed)) {
+      return parsed;
+    }
+  } catch {
+    // Not valid JSON, try to find JSON embedded in text
+    const jsonMatch = content.match(/\{[\s\S]*"interrupt_type"\s*:\s*"tool_approval"[\s\S]*\}/);
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (isToolApprovalInterrupt(parsed)) {
+          return parsed;
+        }
+      } catch {
+        // Ignore parse errors
+      }
+    }
+  }
+  
+  return null;
 }

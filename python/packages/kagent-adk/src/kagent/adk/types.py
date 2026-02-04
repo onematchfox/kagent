@@ -12,11 +12,12 @@ from google.adk.models.anthropic_llm import Claude as ClaudeLLM
 from google.adk.models.google_llm import Gemini as GeminiLLM
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools.agent_tool import AgentTool
-from google.adk.tools.mcp_tool import McpToolset, SseConnectionParams, StreamableHTTPConnectionParams
+from google.adk.tools.mcp_tool import SseConnectionParams, StreamableHTTPConnectionParams
 from google.adk.tools.mcp_tool.mcp_toolset import ReadonlyContext
 from pydantic import BaseModel, Field
 
 from kagent.adk.sandbox_code_executer import SandboxedLocalCodeExecutor
+from kagent.adk._mcp_toolset import McpToolset
 
 from .models import AzureOpenAI as OpenAIAzure
 from .models import OpenAI as OpenAINative
@@ -250,9 +251,8 @@ class AgentConfig(BaseModel):
                     "connection_params": http_tool.params,
                     "tool_filter": http_tool.tools,
                     "header_provider": tool_header_provider,
+                    "require_confirmation": http_tool.require_confirmation is True,
                 }
-                if http_tool.require_confirmation:
-                    toolset_kwargs["require_confirmation"] = True
                 tools.append(McpToolset(**toolset_kwargs))
         if self.sse_tools:
             for sse_tool in self.sse_tools:  # add sse tools
@@ -266,9 +266,8 @@ class AgentConfig(BaseModel):
                     "connection_params": sse_tool.params,
                     "tool_filter": sse_tool.tools,
                     "header_provider": tool_header_provider,
+                    "require_confirmation": sse_tool.require_confirmation is True,
                 }
-                if sse_tool.require_confirmation:
-                    toolset_kwargs["require_confirmation"] = True
                 tools.append(McpToolset(**toolset_kwargs))
         if self.remote_agents:
             for remote_agent in self.remote_agents:  # Add remote agents as tools
@@ -339,6 +338,9 @@ class AgentConfig(BaseModel):
                     httpx_client=client,
                 )
 
+                # Child agent HITL is handled by _agent_executor.py which detects
+                # tool_approval data in the child's response and manages the approval
+                # flow directly via A2A communication.
                 tools.append(AgentTool(agent=remote_a2a_agent))
 
         extra_headers = self.model.headers or {}
