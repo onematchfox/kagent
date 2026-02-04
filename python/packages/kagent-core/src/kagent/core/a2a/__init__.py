@@ -24,9 +24,11 @@ from ._hitl import (
     extract_decision_from_message,
     extract_tool_requests_from_message,
     find_pending_tool_request,
+    find_tool_approval_in_response,
     format_tool_approval_text_parts,
     handle_tool_approval_interrupt,
     is_input_required_task,
+    message_has_tool_approval,
 )
 from ._requests import KAgentRequestContextBuilder
 from ._task_result_aggregator import TaskResultAggregator
@@ -62,8 +64,10 @@ __all__ = [
     "extract_decision_from_message",
     "extract_tool_requests_from_message",
     "find_pending_tool_request",
+    "find_tool_approval_in_response",
     "format_tool_approval_text_parts",
     "is_input_required_task",
+    "message_has_tool_approval",
     # HITL handlers
     "handle_tool_approval_interrupt",
 ]

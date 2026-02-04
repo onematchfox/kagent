@@ -39,10 +39,11 @@ export interface ToolApprovalInterruptData {
 // Type for per-tool decisions
 export type ToolDecisionType = typeof KAGENT_HITL_DECISION_TYPE_APPROVE | typeof KAGENT_HITL_DECISION_TYPE_DENY;
 
-// Optional context when the decision is for a child agent's tool (multi-agent HITL)
-export interface ToolDecisionChildContext {
-  childAgentName: string;
-  parentCallId: string;
+// Optional display context for tool decisions (e.g. agent name for friendly message).
+// Not sent in A2A; backend routes by tool_id only.
+export interface ToolDecisionDisplayContext {
+  /** Agent or tool source name for display (e.g. "SubAgent" in "Approve for SubAgent") */
+  agentName: string;
 }
 
 // Type for a tool decision sent back to the backend
@@ -95,11 +96,8 @@ export function extractToolDecisionsFromMessages(messages: Array<{ role?: string
     
     for (const part of message.parts) {
       if (part.kind === "data" && hasToolDecision(part.data) && part.data.tool_id) {
-        // For child agent HITL, use parent_call_id as key (if available)
-        // This matches how decidedTools is keyed in the UI
-        const data = part.data as { parent_call_id?: string; tool_id: string; decision_type: ToolDecisionType };
-        const key = data.parent_call_id || data.tool_id;
-        decisions.set(key, data.decision_type);
+        const data = part.data as { tool_id: string; decision_type: ToolDecisionType };
+        decisions.set(data.tool_id, data.decision_type);
       }
     }
   }

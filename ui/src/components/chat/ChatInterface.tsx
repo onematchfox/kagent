@@ -30,7 +30,7 @@ import { Message } from "@a2a-js/sdk";
 import {
   ToolDecisionType,
   extractToolDecisionsFromMessages,
-  type ToolDecisionChildContext,
+  type ToolDecisionDisplayContext,
 } from "@/lib/hitl";
 
 interface ChatInterfaceProps {
@@ -98,12 +98,10 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
     }
   });
 
-  // Unified handler for direct tool approval and child agent tool approval (multi-agent HITL).
-  // When childContext is provided, the decision is for a child agent's tool (use parentCallId for UI keying).
   const handleToolDecision = useCallback(async (
     toolId: string,
     decision: ToolDecisionType,
-    childContext?: ToolDecisionChildContext
+    displayContext?: ToolDecisionDisplayContext
   ) => {
     const currentSessionId = session?.id || sessionId;
     if (!currentSessionId) {
@@ -111,7 +109,7 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
       return;
     }
 
-    const decidedToolsKey = childContext?.parentCallId ?? toolId;
+    const decidedToolsKey = toolId;
     setIsStreaming(true);
     setDecidedTools(prev => new Map(prev).set(decidedToolsKey, decision));
     setChatStatus("thinking");
@@ -123,21 +121,18 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
         .map(m => m.taskId)
         .pop();
 
+      // A2A protocol: only decision_type and tool_id (backend routes via session state keyed by tool_id)
       const dataPart: Record<string, unknown> = {
         decision_type: decision,
         tool_id: toolId,
       };
-      if (childContext) {
-        dataPart.child_agent_name = childContext.childAgentName;
-        dataPart.parent_call_id = childContext.parentCallId;
-      }
 
       let decisionText: string;
-      if (childContext) {
-        const friendlyAgentName = childContext.childAgentName.replace(/^kagent__NS__/, "").replace(/_/g, " ");
+      if (displayContext?.agentName) {
+        const friendlyName = displayContext.agentName.replace(/^kagent__NS__/, "").replace(/_/g, " ");
         decisionText = decision === "approve"
-          ? `I approve the tool execution for the ${friendlyAgentName} agent. Please proceed with the delegation.`
-          : `I deny the tool execution for the ${friendlyAgentName} agent. Do not proceed.`;
+          ? `I approve the tool execution for ${friendlyName}. Please proceed.`
+          : `I deny the tool execution for ${friendlyName}. Do not proceed.`;
       } else {
         decisionText = `${toolId}: ${decision}`;
       }

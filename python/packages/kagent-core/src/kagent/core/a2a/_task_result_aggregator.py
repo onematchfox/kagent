@@ -1,6 +1,8 @@
 from a2a.server.events import Event
 from a2a.types import Message, TaskState, TaskStatusUpdateEvent
 
+from ._hitl import message_has_tool_approval
+
 
 class TaskResultAggregator:
     """Aggregates the task status updates and provides the final task state."""
@@ -30,6 +32,10 @@ class TaskResultAggregator:
             ):
                 self._task_state = TaskState.input_required
                 self._task_status_message = event.status.message
+
+                if message_has_tool_approval(event.status.message):
+                    # Don't overwrite the task state and set it to working below
+                    return
             # final state is already recorded and make sure the intermediate state is
             # always working because other state may terminate the event aggregation
             # in a2a request handler

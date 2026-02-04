@@ -75,7 +75,6 @@ def _get_context_metadata(event: Event, invocation_context: InvocationContext) -
         metadata = {
             get_kagent_metadata_key("app_name"): invocation_context.app_name,
             get_kagent_metadata_key("user_id"): invocation_context.user_id,
-            get_kagent_metadata_key("session_id"): invocation_context.session.id,
             get_kagent_metadata_key("invocation_id"): event.invocation_id,
             get_kagent_metadata_key("author"): event.author,
         }
@@ -288,13 +287,25 @@ def _create_status_update_event(
     ):
         # Tool approval in function_response (child or same-agent) requires user input
         status.state = TaskState.input_required
+    elif any(
+        getattr(getattr(part, "root", None), "data", None)
+        and isinstance(part.root.data, dict)
+        and part.root.data.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
+        for part in message.parts
+        if getattr(part, "root", None)
+    ):
+        # Fallback: detect tool_approval by data shape when metadata is missing or shaped differently
+        status.state = TaskState.input_required
 
+    # Input-required (e.g. tool_approval) is the final status until the user responds;
+    # mark it final so we don't send a duplicate final status after the runner loop breaks.
+    is_final = status.state == TaskState.input_required
     return TaskStatusUpdateEvent(
         task_id=task_id,
         context_id=context_id,
         status=status,
         metadata=_get_context_metadata(event, invocation_context),
-        final=False,
+        final=is_final,
     )
 
 

@@ -76,6 +76,37 @@ class TestConvertFunctionResponsePart:
             == A2A_DATA_PART_METADATA_TYPE_FUNCTION_RESPONSE
         )
 
+    def test_function_response_with_tool_approval_normalized_to_unified_format(self):
+        """Tool approval inside a function_response is emitted as same shape as direct tool_approval."""
+        func_response = genai_types.FunctionResponse(
+            name="kagent__NS__sub_agent",
+            id="call_xluaxLv6APpcdqA0nzgdrG27",
+            response={
+                "result": '{"interrupt_type": "tool_approval", "action_requests": ['
+                '{"name": "datetime_get_current_time", "args": {}, "id": "call_R0MD5cZYzdn3hfBeigNvX4zN"}'
+                "]}"
+            },
+        )
+        part = genai_types.Part(function_response=func_response)
+
+        result = convert_genai_part_to_a2a_part(part)
+
+        assert result is not None
+        assert isinstance(result.root, DataPart)
+        assert result.root.data["interrupt_type"] == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
+        assert "action_requests" in result.root.data
+        action_requests = result.root.data["action_requests"]
+        assert len(action_requests) == 1
+        assert action_requests[0]["name"] == "datetime_get_current_time"
+        assert action_requests[0]["id"] == "call_R0MD5cZYzdn3hfBeigNvX4zN"
+        assert (
+            result.root.metadata[get_kagent_metadata_key(A2A_DATA_PART_METADATA_TYPE_KEY)]
+            == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
+        )
+        assert result.root.metadata.get(get_kagent_metadata_key("interrupt_agent_name")) is None
+        assert result.root.metadata[get_kagent_metadata_key("function_call_id")] == "call_xluaxLv6APpcdqA0nzgdrG27"
+        assert result.root.metadata[get_kagent_metadata_key("function_call_name")] == "kagent__NS__sub_agent"
+
 
 class TestConvertAdkRequestConfirmationPart:
     """Tests for converting adk_request_confirmation function calls."""
@@ -107,11 +138,12 @@ class TestConvertAdkRequestConfirmationPart:
             == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
         )
 
-        # Check action_requests structure
+        # Check action_requests structure; confirmation_id is not exposed (backend stores in session)
         action_requests = result.root.data["action_requests"]
         assert len(action_requests) == 1
         assert action_requests[0]["name"] == "dangerous_tool"
         assert action_requests[0]["args"] == {"target": "production"}
         assert action_requests[0]["id"] == "original-call-456"
-        # For ADK confirmation, confirmation_id is stored in metadata
-        assert action_requests[0]["metadata"]["confirmation_id"] == "adk-confirm-123"
+        assert action_requests[0].get("metadata") is None or "confirmation_id" not in (
+            action_requests[0].get("metadata") or {}
+        )

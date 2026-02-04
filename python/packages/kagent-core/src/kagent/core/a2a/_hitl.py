@@ -4,6 +4,7 @@ This module provides types, utilities, and handlers for implementing
 human-in-the-loop workflows in kagent agent executors using A2A protocol primitives.
 """
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from a2a.types import (
 )
 
 from ._consts import (
+    A2A_DATA_PART_METADATA_TYPE_KEY,
     KAGENT_HITL_DECISION_TYPE_APPROVE,
     KAGENT_HITL_DECISION_TYPE_DENY,
     KAGENT_HITL_DECISION_TYPE_KEY,
@@ -47,17 +49,20 @@ DecisionType = Literal["approve", "deny", "reject"]
 class ToolDecision:
     """Type for user decisions in HITL workflows.
 
-    Represents both the decision type and, optionally, the tool to which the decision applies.
+    Callers (UI/A2A) only send decision_type and tool_id. The backend routes using
+    session state keyed by tool_id (same-agent vs child/nested is internal).
 
     Attributes:
         decision_type: The type of decision (approve, deny, reject)
         tool_id: The ID of the tool to which the decision applies, or None if the decision applies to all tools
-        child_agent_name: For multi-agent HITL, the name of the child agent whose tool needs the decision
+        context_id: Internal only; set when this is a forwarded decision (intermediate agent).
+        task_id: Internal only; set when this is a forwarded decision (intermediate agent).
     """
 
     decision_type: DecisionType
     tool_id: str | None
-    child_agent_name: str | None = None
+    context_id: str | None = None
+    task_id: str | None = None
 
 
 @dataclass
@@ -80,6 +85,48 @@ class ToolApprovalRequest:
 
 
 # Utility functions
+
+
+def find_tool_approval_in_response(
+    response: dict[str, Any],
+    name_from_parent: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Recursively find tool_approval data in an ADK function_response.response dict.
+
+    Handles nested agent responses: e.g. parent receives from sub_agent a response
+    whose result is a stringified child_agent response containing tool_approval.
+
+    Returns:
+        (tool_approval_data, agent_name) if found, else (None, None).
+        agent_name is the innermost agent whose response contains the interrupt.
+    """
+    if not isinstance(response, dict):
+        return None, None
+    if response.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL:
+        return response, name_from_parent
+    if "result" not in response:
+        return None, None
+    result = response.get("result")
+    current_name = response.get("name") or name_from_parent
+    if isinstance(result, dict):
+        if result.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL:
+            return result, current_name
+        if "response" in result:
+            return find_tool_approval_in_response(result["response"], result.get("name") or current_name)
+        return find_tool_approval_in_response(result, current_name)
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return None, None
+        if not isinstance(parsed, dict):
+            return None, None
+        if parsed.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL:
+            return parsed, current_name
+        if "response" in parsed:
+            return find_tool_approval_in_response(parsed["response"], parsed.get("name") or current_name)
+        return find_tool_approval_in_response(parsed, parsed.get("name") or current_name)
+    return None, None
 
 
 def escape_markdown_backticks(text: str) -> str:
@@ -113,6 +160,26 @@ def is_input_required_task(task_state: TaskState | None) -> bool:
     return task_state == TaskState.input_required
 
 
+def message_has_tool_approval(message: Message | None) -> bool:
+    """True if the message has any part that is tool_approval (by metadata or data shape)."""
+    if not message or not getattr(message, "parts", None):
+        return False
+    for part in message.parts:
+        root = getattr(part, "root", None)
+        if not root:
+            continue
+        if (
+            getattr(root, "metadata", None)
+            and root.metadata.get(get_kagent_metadata_key(A2A_DATA_PART_METADATA_TYPE_KEY))
+            == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
+        ):
+            return True
+        data = getattr(root, "data", None)
+        if isinstance(data, dict) and data.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL:
+            return True
+    return False
+
+
 def _is_valid_decision(decision: str | None) -> bool:
     """Check if a decision value is valid."""
     return decision in (
@@ -125,18 +192,14 @@ def _is_valid_decision(decision: str | None) -> bool:
 def extract_decision_from_data_part(data: dict) -> ToolDecision | None:
     """Extract decision from structured DataPart.
 
-    Supports several formats using the same decision_type key:
-    1. Global format: {decision_type: "approve"} - applies to all tools
-    2. Per-tool format: {decision_type: "approve", tool_id: "call_123"} - specific tool
-    3. Child agent format: {decision_type: "approve", tool_id: "...", child_agent_name: "agent"} - child agent's tool
+    Public protocol (UI/A2A): {decision_type, tool_id} only.
+    Internal (backend-forwarded): may include context_id, task_id for intermediate agent.
 
     Args:
         data: DataPart.data dictionary
 
     Returns:
         ToolDecision if found and valid, None otherwise.
-        tool_id is None for global decisions.
-        child_agent_name is set when the decision is for a child agent's tool.
     """
     decision = data.get(KAGENT_HITL_DECISION_TYPE_KEY)
     if not _is_valid_decision(decision):
@@ -145,7 +208,8 @@ def extract_decision_from_data_part(data: dict) -> ToolDecision | None:
     return ToolDecision(
         decision_type=decision,
         tool_id=data.get("tool_id"),
-        child_agent_name=data.get("child_agent_name"),
+        context_id=data.get("context_id"),
+        task_id=data.get("task_id"),
     )
 
 

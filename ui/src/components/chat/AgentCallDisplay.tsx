@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { convertToUserFriendlyName } from "@/lib/utils";
 import { ChevronDown, ChevronUp, MessageSquare, Loader2, AlertCircle, CheckCircle, ShieldAlert, Check, X } from "lucide-react";
 import KagentLogo from "../kagent-logo";
-import { parseToolApprovalFromString, ToolApprovalRequest, ToolDecisionType, type ToolDecisionChildContext, KAGENT_HITL_DECISION_TYPE_APPROVE, KAGENT_HITL_DECISION_TYPE_DENY } from "@/lib/hitl";
+import { parseToolApprovalFromString, ToolApprovalRequest, ToolDecisionType, type ToolDecisionDisplayContext, KAGENT_HITL_DECISION_TYPE_APPROVE, KAGENT_HITL_DECISION_TYPE_DENY } from "@/lib/hitl";
 
 export type AgentCallStatus = "requested" | "executing" | "completed" | "denied";
 
@@ -14,11 +14,14 @@ interface AgentCallDisplayProps {
   result?: {
     content: string;
     is_error?: boolean;
-    hasChildHitl?: boolean;  // True if this is child agent HITL (set by backend)
+    /** True when this response contains a tool_approval (backend or parsed). */
+    hasToolApproval?: boolean;
+    /** Agent/source name for display when present. */
+    interruptAgentName?: string;
   };
   status?: AgentCallStatus;
   isError?: boolean;
-  onToolDecision?: (toolId: string, decision: ToolDecisionType, childContext?: ToolDecisionChildContext) => void;
+  onToolDecision?: (toolId: string, decision: ToolDecisionType, displayContext?: ToolDecisionDisplayContext) => void;
   awaitingInput?: boolean;
   isStreaming?: boolean;
 }
@@ -38,24 +41,15 @@ const AgentCallDisplay = ({
   const agentDisplay = useMemo(() => convertToUserFriendlyName(call.name), [call.name]);
   const hasResult = result !== undefined;
   
-  // Check if the result contains a child agent's tool_approval request
-  // Use hasChildHitl flag from backend if available, otherwise parse content
-  const childToolApproval = useMemo(() => {
+  // Detect tool_approval in this response (backend flag or parse content)
+  const toolApproval = useMemo(() => {
     if (!result?.content) return null;
-    // If hasChildHitl flag is set by backend, trust it and parse
-    if (result.hasChildHitl) {
-      return parseToolApprovalFromString(result.content);
-    }
-    // Fallback: try to parse anyway
+    if (result.hasToolApproval) return parseToolApprovalFromString(result.content);
     return parseToolApprovalFromString(result.content);
-  }, [result?.content, result?.hasChildHitl]);
+  }, [result?.content, result?.hasToolApproval]);
   
-  // Get the first action request for display
-  const childToolRequest: ToolApprovalRequest | undefined = childToolApproval?.action_requests?.[0];
-  
-  // Determine if this is awaiting child approval
-  // hasChildHitl flag indicates backend detected child HITL in this response
-  const isChildApprovalNeeded = (result?.hasChildHitl || childToolApproval !== null) && status !== "completed";
+  const toolApprovalRequest: ToolApprovalRequest | undefined = toolApproval?.action_requests?.[0];
+  const isApprovalNeeded = (result?.hasToolApproval || toolApproval !== null) && status !== "completed";
   
   // Button state - disabled during streaming until backend is ready
   const isButtonDisabled = isStreaming && !awaitingInput;
@@ -70,12 +64,11 @@ const AgentCallDisplay = ({
       );
     }
     
-    // Show child approval status if detected
-    if (isChildApprovalNeeded) {
+    if (isApprovalNeeded) {
       return (
         <>
           <ShieldAlert className="w-3 h-3 inline-block mr-2 text-amber-500" />
-          Child tool awaiting approval
+          Tool awaiting approval
         </>
       );
     }
@@ -116,27 +109,28 @@ const AgentCallDisplay = ({
     }
   };
 
-  const childContext: ToolDecisionChildContext | undefined = call.id ? { childAgentName: call.name, parentCallId: call.id } : undefined;
+  const agentNameForDisplay = result?.interruptAgentName ?? call.name;
+  const displayContext: ToolDecisionDisplayContext | undefined = { agentName: agentNameForDisplay };
 
   const handleApprove = () => {
-    if (onToolDecision && childToolRequest?.id) {
-      onToolDecision(childToolRequest.id, KAGENT_HITL_DECISION_TYPE_APPROVE, childContext);
+    if (onToolDecision && toolApprovalRequest?.id) {
+      onToolDecision(toolApprovalRequest.id, KAGENT_HITL_DECISION_TYPE_APPROVE, displayContext);
     }
   };
 
   const handleDeny = () => {
-    if (onToolDecision && childToolRequest?.id) {
-      onToolDecision(childToolRequest.id, KAGENT_HITL_DECISION_TYPE_DENY, childContext);
+    if (onToolDecision && toolApprovalRequest?.id) {
+      onToolDecision(toolApprovalRequest.id, KAGENT_HITL_DECISION_TYPE_DENY, displayContext);
     }
   };
 
   const isDenied = status === "denied";
   const cardBorderClass = isDenied
     ? 'border-red-400 dark:border-red-600'
-    : isChildApprovalNeeded 
-      ? 'border-amber-400 dark:border-amber-600' 
-      : isError 
-        ? 'border-red-300' 
+    : isApprovalNeeded
+      ? 'border-amber-400 dark:border-amber-600'
+      : isError
+        ? 'border-red-300'
         : '';
 
   return (
@@ -167,26 +161,25 @@ const AgentCallDisplay = ({
           )}
         </div>
 
-        <div className="mt-4 w-full">          
-          {/* Show child tool approval details if detected */}
-          {isChildApprovalNeeded && childToolRequest && (
+        <div className="mt-4 w-full">
+          {isApprovalNeeded && toolApprovalRequest && (
             <div className="space-y-2">
               <div className="text-xs text-muted-foreground">
-                Child agent requires approval for tool:
+                Approval required for tool:
               </div>
               <div className="bg-amber-50 dark:bg-amber-950/20 p-3 rounded border border-amber-200 dark:border-amber-800">
-                <div className="text-sm font-medium">{childToolRequest.name}</div>
+                <div className="text-sm font-medium">{toolApprovalRequest.name}</div>
                 <div className="mt-2">
                   <div className="text-xs text-muted-foreground">Arguments:</div>
                   <pre className="text-xs whitespace-pre-wrap break-words mt-1">
-                    {JSON.stringify(childToolRequest.args, null, 2)}
+                    {JSON.stringify(toolApprovalRequest.args, null, 2)}
                   </pre>
                 </div>
               </div>
             </div>
           )}
           
-          {hasResult && result?.content && !isChildApprovalNeeded && (
+          {hasResult && result?.content && !isApprovalNeeded && (
             <div className="space-y-2">
               <button className="text-xs flex items-center gap-2" onClick={() => setAreResultsExpanded(!areResultsExpanded)}>
                 <MessageSquare className="w-4 h-4" />
@@ -205,8 +198,7 @@ const AgentCallDisplay = ({
         </div>
       </CardContent>
       
-      {/* Approval buttons for child tool */}
-      {isChildApprovalNeeded && childToolRequest && onToolDecision && (
+      {isApprovalNeeded && toolApprovalRequest && onToolDecision && (
         <CardFooter className="flex flex-col gap-3 pt-0 pb-4">
           <div className="flex justify-end gap-2 w-full">
             <Button

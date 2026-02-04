@@ -67,10 +67,14 @@ export interface ADKMetadata {
     promptTokenCount?: number;
     candidatesTokenCount?: number;
   };
-  kagent_type?: "function_call" | "function_response";
+  kagent_type?: "function_call" | "function_response" | "tool_approval";
   kagent_author?: string;
   kagent_invocation_id?: string;
   kagent_contains_tool_approval?: boolean;
+  kagent_interrupt_agent_name?: string;
+  /** When part is normalized tool_approval (from a function_response), the original call id/name */
+  kagent_function_call_id?: string;
+  kagent_function_call_name?: string;
   originalType?: OriginalMessageType;
   displaySource?: string;
   toolCallData?: ProcessedToolCallData[];
@@ -105,6 +109,10 @@ export interface ProcessedToolResultData {
   name: string;
   content: string;
   is_error: boolean;
+  /** True when this response contains a tool_approval (direct or from a sub-agent). */
+  hasToolApproval?: boolean;
+  /** When present, the agent/source name for the interrupt (for display). */
+  interruptAgentName?: string;
 }
 
 // Normalize various tool response result shapes into plain text

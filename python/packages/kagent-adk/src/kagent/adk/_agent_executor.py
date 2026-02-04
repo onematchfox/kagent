@@ -33,13 +33,14 @@ from pydantic import BaseModel
 from typing_extensions import override
 
 from kagent.core.a2a import (
+    A2A_DATA_PART_METADATA_TYPE_KEY,
     KAGENT_HITL_DECISION_TYPE_APPROVE,
     KAGENT_HITL_DECISION_TYPE_KEY,
     KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL,
     TaskResultAggregator,
     ToolDecision,
     extract_decision_from_message,
-    find_pending_tool_request,
+    find_tool_approval_in_response,
     get_kagent_metadata_key,
 )
 from kagent.core.tracing._span_processor import (
@@ -53,10 +54,32 @@ from .converters.request_converter import (
     convert_tool_decision_to_adk_function_response,
 )
 
+from ._consts import ADK_CONFIRMATION_ID_BY_TOOL_ID_KEY, ADK_REQUEST_CONFIRMATION_NAME
+
 logger = logging.getLogger("kagent_adk." + __name__)
 
 # Session state key for storing pending child agent HITL contexts
 PENDING_CHILD_HITL_KEY = "kagent_pending_child_hitl"
+
+
+def _extract_adk_confirmation_id_from_event(event: Event) -> tuple[str | None, str | None]:
+    """Extract (tool_id, adk_confirmation_call_id) from an ADK event containing adk_request_confirmation.
+
+    When ADK requests tool confirmation it emits a function_call with name=adk_request_confirmation;
+    we must echo that call's id back in the FunctionResponse. Returns (tool_id, adk_call_id) or (None, None).
+    """
+    if not event.content or not event.content.parts:
+        return None, None
+    for part in event.content.parts:
+        if not part.function_call or part.function_call.name != ADK_REQUEST_CONFIRMATION_NAME:
+            continue
+        args = part.function_call.args or {}
+        original = args.get("originalFunctionCall") or {}
+        tool_id = original.get("id") if isinstance(original, dict) else None
+        adk_call_id = getattr(part.function_call, "id", None)
+        if tool_id and adk_call_id:
+            return str(tool_id), str(adk_call_id)
+    return None, None
 
 
 def _extract_content_from_part(part: Any) -> str | None:
@@ -86,6 +109,79 @@ def _extract_content_from_part(part: Any) -> str | None:
 
     # FilePart or other types - skip
     return None
+
+
+def _message_has_tool_approval(message: Any) -> bool:
+    """True if the message has any part that is tool_approval (by metadata or data shape)."""
+    if not message or not getattr(message, "parts", None):
+        return False
+    for part in message.parts:
+        root = getattr(part, "root", None)
+        if not root:
+            continue
+        if (
+            getattr(root, "metadata", None)
+            and root.metadata.get(get_kagent_metadata_key(A2A_DATA_PART_METADATA_TYPE_KEY))
+            == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
+        ):
+            return True
+        data = getattr(root, "data", None)
+        if isinstance(data, dict) and data.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL:
+            return True
+    return False
+
+
+def _is_working_with_tool_approval(a2a_event: Any) -> bool:
+    """True if this is a working status update whose message contains tool_approval."""
+    if not isinstance(a2a_event, TaskStatusUpdateEvent):
+        return False
+    if a2a_event.status.state != TaskState.working:
+        return False
+    return _message_has_tool_approval(getattr(a2a_event.status, "message", None))
+
+
+def _tool_approval_key(a2a_event: Any) -> tuple[str | None, str | None, str | None]:
+    """(context_id, task_id, first_action_request_id) for deduplication, or (None,None,None) if not tool_approval."""
+    if not isinstance(a2a_event, TaskStatusUpdateEvent):
+        return None, None, None
+    if a2a_event.status.state != TaskState.input_required:
+        return None, None, None
+    message = getattr(a2a_event.status, "message", None)
+    if not message or not getattr(message, "parts", None):
+        return None, None, None
+    for part in message.parts:
+        root = getattr(part, "root", None)
+        if not root:
+            continue
+        data = getattr(root, "data", None) or {}
+        if not isinstance(data, dict):
+            continue
+        is_tool_approval = data.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL or (
+            getattr(root, "metadata", None)
+            and root.metadata.get(get_kagent_metadata_key(A2A_DATA_PART_METADATA_TYPE_KEY))
+            == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
+        )
+        if not is_tool_approval:
+            continue
+        requests = data.get("action_requests") or []
+        first_id = requests[0].get("id") if requests and isinstance(requests[0], dict) else None
+        return getattr(a2a_event, "context_id", None), getattr(a2a_event, "task_id", None), first_id
+    return None, None, None
+
+
+def _upgrade_working_to_input_required(a2a_event: TaskStatusUpdateEvent) -> TaskStatusUpdateEvent:
+    """Return a copy of the event with state=input_required and final=True (so we send tool_approval once)."""
+    return TaskStatusUpdateEvent(
+        task_id=a2a_event.task_id,
+        context_id=a2a_event.context_id,
+        status=TaskStatus(
+            state=TaskState.input_required,
+            message=a2a_event.status.message,
+            timestamp=a2a_event.status.timestamp,
+        ),
+        metadata=a2a_event.metadata,
+        final=True,
+    )
 
 
 class A2aAgentExecutorConfig(BaseModel):
@@ -265,45 +361,40 @@ class A2aAgentExecutor(AgentExecutor):
 
         await runner.session_service.append_event(session, system_event)
 
-        if context.current_task:
-            tool_decision = extract_decision_from_message(context.message)
-            if tool_decision:
-                # Check if this is a decision for a child agent's tool (multi-agent HITL)
-                if tool_decision.child_agent_name:
+        tool_decision = extract_decision_from_message(context.message)
+        if tool_decision:
+            # Route by tool_id (UI/A2A sends only decision_type + tool_id)
+            lookup_key = tool_decision.tool_id
+            if lookup_key:
+                pending_child = session.state.get(PENDING_CHILD_HITL_KEY, {}).get(lookup_key)
+                if pending_child:
                     logger.info(
-                        f"Child agent tool decision: {tool_decision.decision_type} for "
-                        f"tool {tool_decision.tool_id} on agent {tool_decision.child_agent_name}"
+                        f"Tool decision: {tool_decision.decision_type} for tool {tool_decision.tool_id} "
+                        f"(routed by {lookup_key!r})"
                     )
-                    # Forward the decision directly to the child agent
                     child_response, child_response_text = await self._forward_decision_to_child(
                         runner,
-                        tool_decision.child_agent_name,
-                        tool_decision,
-                        session,
+                        lookup_key=lookup_key,
+                        pending_child=pending_child,
+                        tool_decision=tool_decision,
+                        session=session,
                     )
                     if child_response:
                         run_args["new_message"] = child_response
-
-                        # Emit an event with the child's response so the UI can update the tool call display
-                        # This makes the child agent's result visible to the user before the parent processes it
+                        direct_child_name = pending_child.get("direct_child_agent_name", lookup_key)
                         if child_response_text:
-                            # Get the function_call_id from the child_response
                             function_call_id = None
                             if child_response.parts:
                                 for part in child_response.parts:
                                     if part.function_response:
                                         function_call_id = part.function_response.id
                                         break
-
-                            # Create an ADK event for persistence
-                            # This ensures the child's response is available when loading from history
                             child_response_event = Event(
                                 invocation_id=f"child_response_{function_call_id or uuid.uuid4()}",
-                                author=tool_decision.child_agent_name,
+                                author=direct_child_name,
                                 content=child_response,
                             )
                             await runner.session_service.append_event(session, child_response_event)
-
                             await event_queue.enqueue_event(
                                 TaskStatusUpdateEvent(
                                     task_id=context.task_id,
@@ -318,7 +409,7 @@ class A2aAgentExecutor(AgentExecutor):
                                                     DataPart(
                                                         data={
                                                             "id": function_call_id,
-                                                            "name": tool_decision.child_agent_name,
+                                                            "name": direct_child_name,
                                                             "response": {"result": child_response_text},
                                                         },
                                                         metadata={get_kagent_metadata_key("type"): "function_response"},
@@ -332,13 +423,10 @@ class A2aAgentExecutor(AgentExecutor):
                                 )
                             )
                     else:
-                        # Failed to forward - DO NOT run the parent agent as it will likely
-                        # make a new call to the child instead of processing the decision
                         logger.error(
-                            f"Failed to forward decision to child agent '{tool_decision.child_agent_name}'. "
+                            "Failed to forward decision to child agent. "
                             "NOT running parent agent to avoid duplicate child calls."
                         )
-                        # Publish an error event to inform the user
                         await event_queue.enqueue_event(
                             TaskStatusUpdateEvent(
                                 task_id=context.task_id,
@@ -352,7 +440,7 @@ class A2aAgentExecutor(AgentExecutor):
                                             Part(
                                                 TextPart(
                                                     text=(
-                                                        f"Failed to process tool approval for child agent '{tool_decision.child_agent_name}'. "
+                                                        "Failed to process tool approval. "
                                                         "The approval context may have been lost. Please try your request again."
                                                     )
                                                 )
@@ -364,12 +452,14 @@ class A2aAgentExecutor(AgentExecutor):
                                 final=True,
                             )
                         )
-                        return
-                else:
-                    # Single-agent tool approval - use ADK's built-in confirmation mechanism
-                    confirmation_message = self._prepare_confirmation_message(context, tool_decision)
-                    if confirmation_message:
-                        run_args["new_message"] = confirmation_message
+                    await runner.session_service.append_event(session, system_event)
+                    return run_args
+
+            # Same-agent tool approval: look up ADK confirmation call id from session and build response
+            if tool_decision.tool_id:
+                confirmation_message = convert_tool_decision_to_adk_function_response(session, tool_decision)
+                if confirmation_message:
+                    run_args["new_message"] = confirmation_message
 
         # create invocation context
         invocation_context = runner._new_invocation_context(
@@ -378,30 +468,20 @@ class A2aAgentExecutor(AgentExecutor):
             run_config=run_args["run_config"],
         )
 
-        # publish the task working event
-        await event_queue.enqueue_event(
-            TaskStatusUpdateEvent(
-                task_id=context.task_id,
-                status=TaskStatus(
-                    state=TaskState.working,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                ),
-                context_id=context.context_id,
-                final=False,
-                metadata={
-                    get_kagent_metadata_key("app_name"): runner.app_name,
-                    get_kagent_metadata_key("user_id"): run_args["user_id"],
-                    get_kagent_metadata_key("session_id"): run_args["session_id"],
-                },
-            )
-        )
-
         task_result_aggregator = TaskResultAggregator()
         child_hitl_detected = False
+        last_enqueued_tool_approval_key: tuple[str | None, str | None, str | None] = (None, None, None)
         # Preserve session_name before entering the loop - ADK may modify session.state
         original_session_name = session.state.get("session_name")
         async with Aclosing(runner.run_async(**run_args)) as agen:
             async for adk_event in agen:
+                # Store ADK confirmation call id for same-agent tool approval (we must echo it back in the response)
+                tool_id_for_confirmation, adk_confirmation_id = _extract_adk_confirmation_id_from_event(adk_event)
+                if tool_id_for_confirmation and adk_confirmation_id:
+                    if ADK_CONFIRMATION_ID_BY_TOOL_ID_KEY not in session.state:
+                        session.state[ADK_CONFIRMATION_ID_BY_TOOL_ID_KEY] = {}
+                    session.state[ADK_CONFIRMATION_ID_BY_TOOL_ID_KEY][tool_id_for_confirmation] = adk_confirmation_id
+
                 # Check for child agent HITL data and store context for later forwarding
                 child_hitl = self._extract_child_hitl_from_event(adk_event)
                 if child_hitl:
@@ -411,10 +491,17 @@ class A2aAgentExecutor(AgentExecutor):
                 for a2a_event in convert_event_to_a2a_events(
                     adk_event, invocation_context, context.task_id, context.context_id
                 ):
-                    # Only aggregate non-partial events to avoid duplicates from streaming chunks
-                    # Partial events are sent to frontend for display but not accumulated
+                    # Working + tool_approval: upgrade to input_required and send (runner may only send this once).
+                    if _is_working_with_tool_approval(a2a_event):
+                        a2a_event = _upgrade_working_to_input_required(a2a_event)
                     if not adk_event.partial:
                         task_result_aggregator.process_event(a2a_event)
+                    # Skip duplicate: we already sent this tool_approval (e.g. upgraded from working).
+                    key = _tool_approval_key(a2a_event)
+                    if key[0] is not None and key == last_enqueued_tool_approval_key:
+                        continue
+                    if key[0] is not None:
+                        last_enqueued_tool_approval_key = key
                     await event_queue.enqueue_event(a2a_event)
 
                 # When child HITL is detected, break out of the loop to stop processing
@@ -442,10 +529,18 @@ class A2aAgentExecutor(AgentExecutor):
 
                 # Break out of runner loop when input is required (tool confirmation,
                 # child agent HITL, or other scenarios needing external input).
-                # This ensures we stop processing and wait for user approval before
-                # continuing with tool execution or child agent delegation.
                 if task_result_aggregator.task_state == TaskState.input_required:
                     logger.info("Breaking runner loop: input_required state detected")
+                    if not child_hitl_detected:
+                        state_to_persist = dict(session.state)
+                        if original_session_name and "session_name" not in state_to_persist:
+                            state_to_persist["session_name"] = original_session_name
+                        await runner.session_service.create_session(
+                            app_name=runner.app_name,
+                            user_id=run_args["user_id"],
+                            session_id=run_args["session_id"],
+                            state=state_to_persist,
+                        )
                     break
 
         # publish the task result event - this is final
@@ -480,18 +575,21 @@ class A2aAgentExecutor(AgentExecutor):
                 )
             )
         else:
-            await event_queue.enqueue_event(
-                TaskStatusUpdateEvent(
-                    task_id=context.task_id,
-                    status=TaskStatus(
-                        state=task_result_aggregator.task_state,
-                        timestamp=datetime.now(timezone.utc).isoformat(),
-                        message=task_result_aggregator.task_status_message,
-                    ),
-                    context_id=context.context_id,
-                    final=True,
+            # When we broke for input_required, we already sent the final status update
+            # in the loop (converter marks input_required as final). Skip duplicate.
+            if task_result_aggregator.task_state != TaskState.input_required:
+                await event_queue.enqueue_event(
+                    TaskStatusUpdateEvent(
+                        task_id=context.task_id,
+                        status=TaskStatus(
+                            state=task_result_aggregator.task_state,
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            message=task_result_aggregator.task_status_message,
+                        ),
+                        context_id=context.context_id,
+                        final=True,
+                    )
                 )
-            )
 
     async def _prepare_session(self, context: RequestContext, run_args: dict[str, Any], runner: Runner):
         session_id = run_args["session_id"]
@@ -529,45 +627,6 @@ class A2aAgentExecutor(AgentExecutor):
 
         return session
 
-    def _prepare_confirmation_message(
-        self,
-        context: RequestContext,
-        tool_decision: ToolDecision,
-    ) -> genai_types.Content | None:
-        """Prepare confirmation message for HITL resume.
-
-        Finds the pending tool request matching the user's decision and extracts
-        the confirmation_id from its metadata to create an ADK FunctionResponse.
-
-        Args:
-            context: The request context containing the current task
-            tool_decision: The user's decision (approve/deny) and tool ID
-
-        Returns:
-            The confirmation Content to send to ADK, or None if no match found
-        """
-        matched_request = find_pending_tool_request(context.current_task, tool_decision.tool_id)
-        if not matched_request:
-            logger.error(f"No pending tool request found for tool_id: {tool_decision.tool_id}")
-            return None
-
-        # Get the ADK confirmation ID from the request's metadata
-        confirmation_id = matched_request.metadata.get("confirmation_id") if matched_request.metadata else None
-        if not confirmation_id:
-            logger.error(f"No confirmation_id in metadata for tool request: {matched_request.id}")
-            return None
-
-        logger.info(
-            f"HITL resume: {tool_decision.decision_type} for {matched_request.name} (confirmation_id={confirmation_id})"
-        )
-
-        # Create a ToolDecision with the ADK confirmation ID for the response
-        decision_with_confirmation_id = ToolDecision(
-            decision_type=tool_decision.decision_type,
-            tool_id=confirmation_id,
-        )
-        return convert_tool_decision_to_adk_function_response(decision_with_confirmation_id)
-
     def _extract_child_hitl_from_event(self, event: Event) -> dict[str, Any] | None:
         """Extract child agent HITL data from an ADK event.
 
@@ -602,30 +661,10 @@ class A2aAgentExecutor(AgentExecutor):
             if not isinstance(response, dict):
                 continue
 
-            # RemoteA2aAgent wraps the child's response in {"result": "..."}
-            # The tool_approval data may be inside response["result"] as a JSON string
-            tool_approval_data = None
-            if response.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL:
-                tool_approval_data = response
-            elif "result" in response:
-                # Check if the result contains tool_approval data
-                result = response.get("result")
-                if isinstance(result, str):
-                    try:
-                        parsed_result = json.loads(result)
-                        if (
-                            isinstance(parsed_result, dict)
-                            and parsed_result.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
-                        ):
-                            tool_approval_data = parsed_result
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                elif (
-                    isinstance(result, dict)
-                    and result.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
-                ):
-                    tool_approval_data = result
-
+            # Recursively find tool_approval (handles parent -> sub -> child nesting)
+            tool_approval_data, agent_name = find_tool_approval_in_response(
+                response, name_from_parent=part.function_response.name
+            )
             if not tool_approval_data:
                 continue
 
@@ -633,31 +672,67 @@ class A2aAgentExecutor(AgentExecutor):
             if not action_requests:
                 continue
 
-            # Extract child context from action_requests metadata
-            # The child agent includes a2a_context_id and a2a_task_id in the tool_approval event
-            child_context_id = None
-            child_task_id = None
-            if action_requests:
-                first_request = action_requests[0]
-                request_metadata = first_request.get("metadata", {})
-                child_context_id = request_metadata.get("a2a_context_id")
-                child_task_id = request_metadata.get("a2a_task_id")
+            first_request = action_requests[0]
+
+            # Extract context_id and task_id from child response (needed to send approval back to child).
+            # Recurse into response/result/task/status and JSON strings; A2A/ADK may nest these.
+            def _get_context_task(
+                obj: Any, _seen: set[int] | None = None
+            ) -> tuple[str | None, str | None]:
+                if _seen is None:
+                    _seen = set()
+                if id(obj) in _seen:
+                    return None, None
+                if isinstance(obj, dict):
+                    _seen.add(id(obj))
+                    cid = obj.get("contextId") or obj.get("context_id")
+                    tid = obj.get("taskId") or obj.get("task_id")
+                    if cid is not None and tid is not None:
+                        return cid, tid
+                    # task.id is often the task_id in A2A
+                    if tid is None and "id" in obj and (obj.get("contextId") or obj.get("context_id")):
+                        tid = obj.get("id")
+                        if tid is not None and cid is not None:
+                            return cid, str(tid)
+                    for key in ("result", "response", "task", "status"):
+                        if key in obj:
+                            found = _get_context_task(obj[key], _seen)
+                            if found[0] is not None and found[1] is not None:
+                                return found
+                    for v in obj.values():
+                        if isinstance(v, dict):
+                            found = _get_context_task(v, _seen)
+                            if found[0] is not None and found[1] is not None:
+                                return found
+                    return cid, tid
+                if isinstance(obj, str):
+                    try:
+                        parsed = json.loads(obj)
+                        return _get_context_task(parsed, _seen)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                return None, None
+
+            child_context_id, child_task_id = _get_context_task(response)
+
+            # Store under tool_id (action_requests[0]["id"]) so UI/caller only sends tool_id for routing
+            function_call_id = part.function_response.id
+            direct_child_agent_name = part.function_response.name
+            tool_id = first_request.get("id") if first_request else None
 
             logger.info(
-                f"Detected child agent HITL in event: agent={part.function_response.name}, "
-                f"action_requests={len(action_requests)}, "
+                f"Detected child agent HITL in event: direct_child={direct_child_agent_name}, "
+                f"action_requests={len(action_requests)}, tool_id={tool_id}, "
                 f"child_context_id={child_context_id}, child_task_id={child_task_id}"
             )
 
-            # Get the agent name from the function_response (it's the AgentTool name)
-            agent_name = part.function_response.name
-
             return {
-                "agent_name": agent_name,
                 "context_id": child_context_id,
                 "task_id": child_task_id,
                 "action_requests": action_requests,
-                "function_call_id": part.function_response.id,
+                "function_call_id": function_call_id,
+                "direct_child_agent_name": direct_child_agent_name,
+                "tool_id": tool_id,
             }
 
         return None
@@ -679,51 +754,47 @@ class A2aAgentExecutor(AgentExecutor):
         if PENDING_CHILD_HITL_KEY not in session.state:
             session.state[PENDING_CHILD_HITL_KEY] = {}
 
-        agent_name = child_hitl["agent_name"]
+        # Key by tool_id so UI/A2A only sends tool_id for routing.
+        # Also key by function_call_id and direct_child_agent_name so cleanup can remove all aliases.
+        tool_id = child_hitl.get("tool_id")
+        function_call_id = child_hitl["function_call_id"]
+        direct_child_agent_name = child_hitl["direct_child_agent_name"]
         context_data = {
             "context_id": child_hitl["context_id"],
             "task_id": child_hitl["task_id"],
             "action_requests": child_hitl["action_requests"],
-            "function_call_id": child_hitl["function_call_id"],
+            "function_call_id": function_call_id,
+            "direct_child_agent_name": direct_child_agent_name,
         }
-        session.state[PENDING_CHILD_HITL_KEY][agent_name] = context_data
+        if tool_id:
+            session.state[PENDING_CHILD_HITL_KEY][tool_id] = context_data
+        session.state[PENDING_CHILD_HITL_KEY][function_call_id] = context_data
+        session.state[PENDING_CHILD_HITL_KEY][direct_child_agent_name] = context_data
 
         logger.info(
-            f"Stored child HITL context for agent '{agent_name}': "
-            f"context_id={child_hitl['context_id']}, task_id={child_hitl['task_id']}, "
-            f"function_call_id={child_hitl.get('function_call_id')}, session_id={session.id}"
+            f"Stored child HITL context: tool_id={tool_id}, direct_child={direct_child_agent_name}, "
+            f"context_id={child_hitl['context_id']}, task_id={child_hitl['task_id']}, session_id={session.id}"
         )
 
     async def _forward_decision_to_child(
         self,
         runner: Runner,
-        child_agent_name: str,
+        *,
+        lookup_key: str,
+        pending_child: dict[str, Any],
         tool_decision: ToolDecision,
         session: Any,
     ) -> tuple[genai_types.Content | None, str | None]:
-        """Forward a tool decision to a child agent via direct A2A call.
+        """Forward a tool decision to the appropriate child (direct or nested).
 
-        Args:
-            runner: The parent's runner (to access child agent tools)
-            child_agent_name: Name of the child agent
-            tool_decision: The user's decision
-            session: The parent's session (to get stored child context)
+        Routes to direct_child_agent_name from stored context.
 
         Returns:
-            A tuple of (Content object with the child's response, response text) or (None, None) if failed
+            (Content with child's response, response text) or (None, None) if failed.
         """
-        # Get stored child context from session state (persisted via session service on break)
-        logger.info(
-            f"Looking up child HITL context: agent='{child_agent_name}', session_id='{session.id}'"
-        )
-
-        pending_child = session.state.get(PENDING_CHILD_HITL_KEY, {}).get(child_agent_name)
-        if not pending_child:
-            session_state_agents = list(session.state.get(PENDING_CHILD_HITL_KEY, {}).keys())
-            logger.error(
-                f"No pending child HITL context found for agent '{child_agent_name}'. "
-                f"Session state agents: {session_state_agents}"
-            )
+        direct_child_agent_name = pending_child.get("direct_child_agent_name")
+        if not direct_child_agent_name:
+            logger.error("No direct_child_agent_name in pending child HITL context")
             return None, None
 
         child_context_id = pending_child.get("context_id")
@@ -731,29 +802,33 @@ class A2aAgentExecutor(AgentExecutor):
         action_requests = pending_child.get("action_requests", [])
 
         if not child_context_id:
-            logger.error(f"No context_id in stored child HITL context for agent '{child_agent_name}'")
+            logger.error("No context_id in stored child HITL context")
             return None, None
 
-        # Find the child agent's RemoteA2aAgent in the runner's tools
+        logger.info(
+            f"Forwarding decision to direct child '{direct_child_agent_name}', "
+            f"context_id={child_context_id}, session_id={session.id}"
+        )
+
         child_agent = None
         from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
         from google.adk.tools.agent_tool import AgentTool
 
         for tool in runner.agent.tools:
-            if isinstance(tool, AgentTool) and tool.agent.name == child_agent_name:
+            if isinstance(tool, AgentTool) and tool.agent.name == direct_child_agent_name:
                 if isinstance(tool.agent, RemoteA2aAgent):
                     child_agent = tool.agent
                     break
 
         if not child_agent:
-            logger.error(f"Could not find RemoteA2aAgent for '{child_agent_name}'")
+            logger.error(f"Could not find RemoteA2aAgent for '{direct_child_agent_name}'")
             return None, None
 
         # Ensure the child agent is resolved (has HTTP client and agent card)
         try:
             await child_agent._ensure_resolved()
         except Exception as e:
-            logger.error(f"Failed to resolve child agent '{child_agent_name}': {e}")
+            logger.error(f"Failed to resolve child agent '{direct_child_agent_name}': {e}")
             return None, None
 
         # Build the decision message to send to child
@@ -762,16 +837,17 @@ class A2aAgentExecutor(AgentExecutor):
 
         # Add the decision as a DataPart
         for action_request in action_requests:
-            # Use the LLM-assigned tool call ID (e.g., "call_...")
-            # This is what find_pending_tool_request() matches against
-            # The child's _prepare_confirmation_message will look up the ADK
-            # confirmation ID from the matched request's metadata
             tool_id = action_request.get("id")
 
             decision_data = {
                 KAGENT_HITL_DECISION_TYPE_KEY: tool_decision.decision_type,
-                "tool_id": tool_id,  # Use LLM call ID, not ADK confirmation_id
+                "tool_id": tool_id,
             }
+            # Include context_id/task_id so an intermediate agent can forward to the final child
+            if child_context_id:
+                decision_data["context_id"] = child_context_id
+            if child_task_id:
+                decision_data["task_id"] = child_task_id
             decision_parts.append(A2APart(DataPart(data=decision_data)))
 
         # Add a text summary
@@ -792,7 +868,7 @@ class A2aAgentExecutor(AgentExecutor):
         )
 
         logger.info(
-            f"Forwarding decision to child agent '{child_agent_name}': "
+            f"Forwarding decision to '{direct_child_agent_name}': "
             f"{tool_decision.decision_type}, context_id={child_context_id}"
         )
 
@@ -868,9 +944,12 @@ class A2aAgentExecutor(AgentExecutor):
                         response_content = "\n".join(response_parts)
                         logger.info(f"Extracted response content from message: {len(response_content)} chars")
 
-            # Clear the pending child HITL context and persist so any pod sees updated state
+            # Clear the pending child HITL context (we store under tool_id, function_call_id, direct_child_agent_name)
             if PENDING_CHILD_HITL_KEY in session.state:
-                session.state[PENDING_CHILD_HITL_KEY].pop(child_agent_name, None)
+                session.state[PENDING_CHILD_HITL_KEY].pop(lookup_key, None)
+                session.state[PENDING_CHILD_HITL_KEY].pop(pending_child.get("tool_id"), None)
+                session.state[PENDING_CHILD_HITL_KEY].pop(pending_child.get("function_call_id"), None)
+                session.state[PENDING_CHILD_HITL_KEY].pop(pending_child.get("direct_child_agent_name"), None)
             await runner.session_service.create_session(
                 app_name=runner.app_name,
                 user_id=session.user_id,
@@ -879,11 +958,9 @@ class A2aAgentExecutor(AgentExecutor):
             )
 
             if response_content:
-                logger.info(f"Successfully got response from child agent '{child_agent_name}'")
-                # Create a FunctionResponse to return to the parent's LLM
-                # Note: FunctionResponse.response must be a dict, not a string
+                logger.info(f"Successfully got response from child agent '{direct_child_agent_name}'")
                 function_response = genai_types.FunctionResponse(
-                    name=child_agent_name,
+                    name=direct_child_agent_name,
                     id=pending_child.get("function_call_id"),
                     response={"result": response_content},
                 )
@@ -892,9 +969,9 @@ class A2aAgentExecutor(AgentExecutor):
                     parts=[genai_types.Part(function_response=function_response)],
                 ), response_content
 
-            logger.warning(f"No response content from child agent '{child_agent_name}'")
+            logger.warning(f"No response content from child agent '{direct_child_agent_name}'")
             return None, None
 
         except Exception as e:
-            logger.error(f"Failed to forward decision to child agent '{child_agent_name}': {e}")
+            logger.error(f"Failed to forward decision to child agent '{direct_child_agent_name}': {e}")
             return None, None

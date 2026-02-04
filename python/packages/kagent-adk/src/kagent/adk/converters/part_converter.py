@@ -27,20 +27,19 @@ from a2a import types as a2a_types
 from google.genai import types as genai_types
 
 from kagent.core.a2a import (
-    A2A_DATA_PART_METADATA_CONTAINS_TOOL_APPROVAL_KEY,
     A2A_DATA_PART_METADATA_TYPE_CODE_EXECUTION_RESULT,
     A2A_DATA_PART_METADATA_TYPE_EXECUTABLE_CODE,
     A2A_DATA_PART_METADATA_TYPE_FUNCTION_CALL,
     A2A_DATA_PART_METADATA_TYPE_FUNCTION_RESPONSE,
     A2A_DATA_PART_METADATA_TYPE_KEY,
     KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL,
+    find_tool_approval_in_response,
     get_kagent_metadata_key,
 )
 
-logger = logging.getLogger("kagent_adk." + __name__)
+from .._consts import ADK_REQUEST_CONFIRMATION_NAME
 
-# ADK's function name for confirmation requests
-ADK_REQUEST_CONFIRMATION_NAME = "adk_request_confirmation"
+logger = logging.getLogger("kagent_adk." + __name__)
 
 
 def convert_a2a_part_to_genai_part(
@@ -173,19 +172,6 @@ def convert_genai_part_to_a2a_part(
             args = part.function_call.args or {}
             original_call = args.get("originalFunctionCall", {})
 
-            # Convert to generic tool approval format
-            # - action_requests[].id = original tool call ID (for UI matching)
-            # - action_requests[].metadata = framework-specific data (ADK stores confirmation_id here)
-            # - action_requests[].metadata.a2a_context_id/task_id = A2A context for multi-agent forwarding
-            action_metadata = {
-                "confirmation_id": part.function_call.id,
-            }
-            # Include A2A context for multi-agent HITL forwarding
-            if context_id:
-                action_metadata["a2a_context_id"] = context_id
-            if task_id:
-                action_metadata["a2a_task_id"] = task_id
-
             return a2a_types.Part(
                 root=a2a_types.DataPart(
                     data={
@@ -195,7 +181,6 @@ def convert_genai_part_to_a2a_part(
                                 "name": original_call.get("name", ""),
                                 "args": original_call.get("args", {}),
                                 "id": original_call.get("id"),
-                                "metadata": action_metadata,
                             }
                         ],
                     },
@@ -219,31 +204,53 @@ def convert_genai_part_to_a2a_part(
 
     if part.function_response:
         response = part.function_response.response
-        contains_interrupt = False
+        # Filter out ADK's placeholder "requires confirmation" response (not a real result)
+        if isinstance(response, dict) and isinstance(response.get("error"), str):
+            if "requires confirmation before execution" in response["error"]:
+                return None
+        tool_approval_data = None
+        interrupt_agent_name = None
         if isinstance(response, dict):
-            # Flag when this function_response contains tool_approval so event_converter
-            # sets input_required (wrapped = child-agent; direct = same-agent or other).
-            contains_interrupt = _has_tool_approval_in_response(response)
-            if contains_interrupt:
-                logger.info(
-                    f"Detected tool_approval in function_response: "
-                    f"function_call_id={part.function_response.id}"
+            tool_approval_data, interrupt_agent_name = find_tool_approval_in_response(response)
+
+        # When a function_response contains tool_approval (direct or nested), emit the same
+        # data shape as direct tool approval so callers only handle one format:
+        # data = { interrupt_type, action_requests }, metadata = { kagent_type: "tool_approval", ... }
+        if tool_approval_data is not None:
+            action_requests = tool_approval_data.get("action_requests", [])
+            logger.info(
+                f"Normalizing function_response with tool_approval to unified format: "
+                f"function_call_id={part.function_response.id}, interrupt_agent={interrupt_agent_name}"
+            )
+            metadata = {
+                get_kagent_metadata_key(A2A_DATA_PART_METADATA_TYPE_KEY): KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL,
+            }
+            if interrupt_agent_name:
+                metadata[get_kagent_metadata_key("interrupt_agent_name")] = interrupt_agent_name
+            if part.function_response.id:
+                metadata[get_kagent_metadata_key("function_call_id")] = part.function_response.id
+            if part.function_response.name:
+                metadata[get_kagent_metadata_key("function_call_name")] = part.function_response.name
+
+            return a2a_types.Part(
+                root=a2a_types.DataPart(
+                    data={
+                        "interrupt_type": KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL,
+                        "action_requests": action_requests,
+                    },
+                    metadata=metadata,
                 )
-                # Keep as function_response but add metadata flag for event_converter
-                # The UI's AgentCallDisplay will detect the tool_approval from result.content
+            )
 
-        # Build metadata for the function_response
-        metadata = {
-            get_kagent_metadata_key(A2A_DATA_PART_METADATA_TYPE_KEY): A2A_DATA_PART_METADATA_TYPE_FUNCTION_RESPONSE
-        }
-        # Add flag so event_converter sets input_required
-        if contains_interrupt:
-            metadata[get_kagent_metadata_key(A2A_DATA_PART_METADATA_CONTAINS_TOOL_APPROVAL_KEY)] = True
-
+        # No tool_approval: pass through as regular function_response
         return a2a_types.Part(
             root=a2a_types.DataPart(
                 data=part.function_response.model_dump(by_alias=True, exclude_none=True),
-                metadata=metadata,
+                metadata={
+                    get_kagent_metadata_key(
+                        A2A_DATA_PART_METADATA_TYPE_KEY
+                    ): A2A_DATA_PART_METADATA_TYPE_FUNCTION_RESPONSE
+                },
             )
         )
 
@@ -276,30 +283,3 @@ def convert_genai_part_to_a2a_part(
         part,
     )
     return None
-
-
-def _has_tool_approval_in_response(response: dict) -> bool:
-    """True if ADK function_response contains tool_approval (direct or wrapped).
-
-    ADK/runner can produce two shapes:
-    - Direct: response["interrupt_type"] == "tool_approval".
-    - Wrapped: response["result"] (string or dict) with interrupt data inside;
-      we use this in _agent_executor when returning from a child agent.
-    """
-    if response.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL:
-        return True
-    if "result" not in response:
-        return False
-    result = response.get("result")
-    if isinstance(result, dict):
-        return result.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
-    if isinstance(result, str):
-        try:
-            parsed = json.loads(result)
-            return (
-                isinstance(parsed, dict)
-                and parsed.get("interrupt_type") == KAGENT_HITL_INTERRUPT_TYPE_TOOL_APPROVAL
-            )
-        except (json.JSONDecodeError, TypeError):
-            pass
-    return False

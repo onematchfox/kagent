@@ -5,7 +5,7 @@ import AgentCallDisplay, { AgentCallStatus } from "@/components/chat/AgentCallDi
 import { isAgentToolName } from "@/lib/utils";
 import { ADKMetadata, ProcessedToolResultData, ToolResponseData, normalizeToolResultToText } from "@/lib/messageHandlers";
 import { FunctionCall } from "@/types";
-import { ToolDecisionType, type ToolDecisionChildContext, KAGENT_HITL_DECISION_TYPE_DENY, getToolApprovalIdFromPart, parseToolApprovalFromString } from "@/lib/hitl";
+import { ToolDecisionType, type ToolDecisionDisplayContext, KAGENT_HITL_DECISION_TYPE_DENY, getToolApprovalIdFromPart, parseToolApprovalFromString } from "@/lib/hitl";
 
 // Convert ToolCallStatus to AgentCallStatus (pending_approval doesn't apply to agent calls)
 const toAgentStatus = (status: ToolCallStatus): AgentCallStatus => {
@@ -18,7 +18,7 @@ const toAgentStatus = (status: ToolCallStatus): AgentCallStatus => {
 interface ToolCallDisplayProps {
   currentMessage: Message;
   allMessages: Message[];
-  onToolDecision?: (toolId: string, decision: ToolDecisionType, childContext?: ToolDecisionChildContext) => void;
+  onToolDecision?: (toolId: string, decision: ToolDecisionType, displayContext?: ToolDecisionDisplayContext) => void;
   decidedTools?: Map<string, ToolDecisionType>;
   isStreaming?: boolean;
 }
@@ -36,6 +36,8 @@ interface ToolCallState {
   result?: {
     content: string;
     is_error?: boolean;
+    hasToolApproval?: boolean;
+    interruptAgentName?: string;
   };
   status: ToolCallStatus;
   /** Confirmation info if this tool is pending approval */
@@ -71,17 +73,16 @@ const isToolCallExecutionMessage = (message: Message): boolean => {
   const hasDataParts = message.parts?.some(part => {
     if (part.kind === "data" && part.metadata) {
       const partMetadata = part.metadata as ADKMetadata;
-      return partMetadata?.kagent_type === "function_response";
+      return partMetadata?.kagent_type === "function_response" || partMetadata?.kagent_type === "tool_approval";
     }
     return false;
   }) || false;
-  
-  // Fallback to streaming format check
+
   if (!hasDataParts) {
     const metadata = message.metadata as ADKMetadata;
     return metadata?.originalType === "ToolCallExecutionEvent";
   }
-  
+
   return hasDataParts;
 };
 
@@ -133,29 +134,44 @@ const extractToolCallRequests = (message: Message): FunctionCall[] => {
 const extractToolCallResults = (message: Message): ProcessedToolResultData[] => {
   if (!isToolCallExecutionMessage(message)) return [];
   
-  // Check for stored task format first (data parts)
   const dataParts = message.parts?.filter(part => part.kind === "data") || [];
   const toolResults: ProcessedToolResultData[] = [];
   
   for (const part of dataParts) {
-    if (part.metadata) {
-      const partMetadata = part.metadata as ADKMetadata;
-      if (partMetadata?.kagent_type === "function_response") {
-        const data = part.data as unknown as ToolResponseData;
-        // Extract normalized content from the result (supports string/object/array)
-        const textContent = normalizeToolResultToText(data);
-        
+    if (!part.metadata) continue;
+    const partMetadata = part.metadata as ADKMetadata;
+
+    // Normalized tool_approval part (same shape for direct and sub-agent): data = { interrupt_type, action_requests }
+    if (partMetadata?.kagent_type === "tool_approval") {
+      const callId = partMetadata.kagent_function_call_id;
+      if (callId && part.data && typeof part.data === "object") {
+        const data = part.data as { interrupt_type?: string; action_requests?: unknown[] };
         toolResults.push({
-          call_id: data.id,
-          name: data.name,
-          content: textContent,
-          is_error: data.response?.isError || false
+          call_id: callId,
+          name: partMetadata.kagent_function_call_name ?? "",
+          content: JSON.stringify(data),
+          is_error: false,
+          hasToolApproval: true,
+          interruptAgentName: partMetadata.kagent_interrupt_agent_name as string | undefined,
         });
       }
+      continue;
+    }
+
+    if (partMetadata?.kagent_type === "function_response") {
+      const data = part.data as unknown as ToolResponseData;
+      const textContent = normalizeToolResultToText(data);
+      toolResults.push({
+        call_id: data.id,
+        name: data.name,
+        content: textContent,
+        is_error: data.response?.isError || false,
+        hasToolApproval: partMetadata.kagent_contains_tool_approval === true,
+        interruptAgentName: partMetadata.kagent_interrupt_agent_name as string | undefined,
+      });
     }
   }
   
-  // If we found tool results in data parts, return them
   if (toolResults.length > 0) {
     return toolResults;
   }
@@ -168,14 +184,20 @@ const extractToolCallResults = (message: Message): ProcessedToolResultData[] => 
   try {
     const metadata = message.metadata as ADKMetadata;
     const resultData = metadata?.toolResultData || JSON.parse(content || "[]");
-    return Array.isArray(resultData) ? resultData : [];
+    const arr = Array.isArray(resultData) ? resultData : [];
+    // Normalize legacy hasChildHitl -> hasToolApproval so UI treats all tool approvals the same
+    return arr.map((r: ProcessedToolResultData & { hasChildHitl?: boolean }) => ({
+      ...r,
+      hasToolApproval: r.hasToolApproval ?? r.hasChildHitl,
+    }));
   } catch {
     return [];
   }
 };
 
-// Extract confirmation requests from tool_approval interrupt data
-// Returns a map of original tool ID -> confirmation info
+// Extract confirmation requests from tool_approval interrupt data.
+// Map key = call id (function_call_id for agent calls, tool_id for direct) so we match newToolCalls.
+// ConfirmationInfo.id = tool_id (for backend decision and decidedTools lookup).
 const extractConfirmationRequests = (messages: Message[]): Map<string, ConfirmationInfo> => {
   const confirmations = new Map<string, ConfirmationInfo>();
 
@@ -184,14 +206,15 @@ const extractConfirmationRequests = (messages: Message[]): Map<string, Confirmat
     const awaitingInput = messageMetadata?.awaiting_input === true;
 
     for (const part of message.parts ?? []) {
-      const id = getToolApprovalIdFromPart(part);
-      if (id) {
-        const existing = confirmations.get(id);
-        confirmations.set(id, {
-          id,
-          awaitingInput: awaitingInput || existing?.awaitingInput,
-        });
-      }
+      const toolId = getToolApprovalIdFromPart(part);
+      if (!toolId) continue;
+      const meta = part.metadata as ADKMetadata | undefined;
+      const callId = meta?.kagent_function_call_id ?? toolId;
+      const existing = confirmations.get(callId);
+      confirmations.set(callId, {
+        id: toolId,
+        awaitingInput: awaitingInput || existing?.awaitingInput,
+      });
     }
   }
 
@@ -272,12 +295,12 @@ const ToolCallDisplay = ({
             
             // If this tool has a pending confirmation request and no decision has been made,
             // any result is an intermediate "awaiting approval" response - skip it
-            // EXCEPT for child agent HITL where the result contains the tool_approval data
+            // EXCEPT when the result contains tool_approval data (e.g. from a sub-agent response)
             const hasPendingConfirmation = confirmationRequests.has(result.call_id);
             const hasDecision = decidedTools.has(result.call_id);
-            const hasChildHitl = result.content && parseToolApprovalFromString(result.content);
+            const hasToolApprovalInResult = result.content && parseToolApprovalFromString(result.content);
             
-            if (hasPendingConfirmation && !hasDecision && !hasChildHitl) {
+            if (hasPendingConfirmation && !hasDecision && !hasToolApprovalInResult) {
               // Don't set result - this is just an intermediate status
               // Keep the tool in "requested" state until proper confirmation data arrives
               continue;
@@ -285,7 +308,9 @@ const ToolCallDisplay = ({
             
             existingCall.result = {
               content: result.content,
-              is_error: result.is_error
+              is_error: result.is_error,
+              hasToolApproval: result.hasToolApproval,
+              interruptAgentName: result.interruptAgentName,
             };
             existingCall.status = "executing";
           }
@@ -345,12 +370,10 @@ const ToolCallDisplay = ({
     // until fourth pass sets pending_approval or streaming ends
     
     // Fourth pass: apply pending_approval or denied status for tools with confirmation requests
-    confirmationRequests.forEach((confirmInfo, id) => {
-      if (newToolCalls.has(id)) {
-        const toolCall = newToolCalls.get(id)!;
-        
-        // Check if user has already made a decision for this tool
-        const decision = decidedTools.get(id);
+    confirmationRequests.forEach((confirmInfo, callId) => {
+      if (newToolCalls.has(callId)) {
+        const toolCall = newToolCalls.get(callId)!;
+        const decision = decidedTools.get(confirmInfo.id);
         
         if (decision) {
           // User made a decision (approve or deny)
@@ -381,10 +404,9 @@ const ToolCallDisplay = ({
           toolCall.confirmationInfo = confirmInfo;
           // Track whether backend is ready for user input
           toolCall.awaitingInput = confirmInfo.awaitingInput;
-          // For child agent HITL, preserve the result so AgentCallDisplay can detect tool_approval
-          // For regular HITL, clear the stale intermediate "awaiting approval" result
-          const hasChildHitl = toolCall.result?.content && parseToolApprovalFromString(toolCall.result.content);
-          if (!hasChildHitl) {
+          // When result contains tool_approval (e.g. sub-agent), preserve it for the approval UI
+          const hasToolApprovalInResult = toolCall.result?.content && parseToolApprovalFromString(toolCall.result.content);
+          if (!hasToolApprovalInResult) {
             toolCall.result = undefined;
           }
         }
