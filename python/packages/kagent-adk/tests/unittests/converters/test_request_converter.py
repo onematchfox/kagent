@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 
-from kagent.adk._consts import ADK_CONFIRMATION_ID_BY_TOOL_ID_KEY
+from kagent.adk._consts import PENDING_TOOL_CONFIRMATION_KEY
 from kagent.adk.converters.request_converter import (
     ADK_REQUEST_CONFIRMATION_NAME,
     convert_tool_decision_to_adk_function_response,
@@ -15,10 +15,12 @@ from kagent.core.a2a import (
 
 
 def _make_session(adk_confirmation_id_by_tool_id):
-    """Mock session with state containing ADK confirmation id mapping."""
-    return SimpleNamespace(
-        state={ADK_CONFIRMATION_ID_BY_TOOL_ID_KEY: dict(adk_confirmation_id_by_tool_id)}
-    )
+    """Mock session with state containing pending tool confirmation (same_agent entries)."""
+    pending = {
+        tid: {"type": "same_agent", "adk_confirmation_id": cid}
+        for tid, cid in adk_confirmation_id_by_tool_id.items()
+    }
+    return SimpleNamespace(state={PENDING_TOOL_CONFIRMATION_KEY: pending})
 
 
 def _make_session_empty():

@@ -54,12 +54,9 @@ from .converters.request_converter import (
     convert_tool_decision_to_adk_function_response,
 )
 
-from ._consts import ADK_CONFIRMATION_ID_BY_TOOL_ID_KEY, ADK_REQUEST_CONFIRMATION_NAME
+from ._consts import ADK_REQUEST_CONFIRMATION_NAME, PENDING_TOOL_CONFIRMATION_KEY
 
 logger = logging.getLogger("kagent_adk." + __name__)
-
-# Session state key for storing pending child agent HITL contexts
-PENDING_CHILD_HITL_KEY = "kagent_pending_child_hitl"
 
 
 def _extract_adk_confirmation_id_from_event(event: Event) -> tuple[str | None, str | None]:
@@ -366,8 +363,8 @@ class A2aAgentExecutor(AgentExecutor):
             # Route by tool_id (UI/A2A sends only decision_type + tool_id)
             lookup_key = tool_decision.tool_id
             if lookup_key:
-                pending_child = session.state.get(PENDING_CHILD_HITL_KEY, {}).get(lookup_key)
-                if pending_child:
+                pending = session.state.get(PENDING_TOOL_CONFIRMATION_KEY, {}).get(lookup_key)
+                if pending and pending.get("type") == "child":
                     logger.info(
                         f"Tool decision: {tool_decision.decision_type} for tool {tool_decision.tool_id} "
                         f"(routed by {lookup_key!r})"
@@ -375,13 +372,13 @@ class A2aAgentExecutor(AgentExecutor):
                     child_response, child_response_text = await self._forward_decision_to_child(
                         runner,
                         lookup_key=lookup_key,
-                        pending_child=pending_child,
+                        pending_child=pending,
                         tool_decision=tool_decision,
                         session=session,
                     )
                     if child_response:
                         run_args["new_message"] = child_response
-                        direct_child_name = pending_child.get("direct_child_agent_name", lookup_key)
+                        direct_child_name = pending.get("agent_name", lookup_key)
                         if child_response_text:
                             function_call_id = None
                             if child_response.parts:
@@ -478,9 +475,12 @@ class A2aAgentExecutor(AgentExecutor):
                 # Store ADK confirmation call id for same-agent tool approval (we must echo it back in the response)
                 tool_id_for_confirmation, adk_confirmation_id = _extract_adk_confirmation_id_from_event(adk_event)
                 if tool_id_for_confirmation and adk_confirmation_id:
-                    if ADK_CONFIRMATION_ID_BY_TOOL_ID_KEY not in session.state:
-                        session.state[ADK_CONFIRMATION_ID_BY_TOOL_ID_KEY] = {}
-                    session.state[ADK_CONFIRMATION_ID_BY_TOOL_ID_KEY][tool_id_for_confirmation] = adk_confirmation_id
+                    if PENDING_TOOL_CONFIRMATION_KEY not in session.state:
+                        session.state[PENDING_TOOL_CONFIRMATION_KEY] = {}
+                    session.state[PENDING_TOOL_CONFIRMATION_KEY][tool_id_for_confirmation] = {
+                        "type": "same_agent",
+                        "adk_confirmation_id": adk_confirmation_id,
+                    }
 
                 # Check for child agent HITL data and store context for later forwarding
                 child_hitl = self._extract_child_hitl_from_event(adk_event)
@@ -675,53 +675,41 @@ class A2aAgentExecutor(AgentExecutor):
             first_request = action_requests[0]
 
             # Extract context_id and task_id from child response (needed to send approval back to child).
-            # Recurse into response/result/task/status and JSON strings; A2A/ADK may nest these.
-            def _get_context_task(
-                obj: Any, _seen: set[int] | None = None
-            ) -> tuple[str | None, str | None]:
-                if _seen is None:
-                    _seen = set()
-                if id(obj) in _seen:
-                    return None, None
-                if isinstance(obj, dict):
-                    _seen.add(id(obj))
-                    cid = obj.get("contextId") or obj.get("context_id")
-                    tid = obj.get("taskId") or obj.get("task_id")
-                    if cid is not None and tid is not None:
-                        return cid, tid
-                    # task.id is often the task_id in A2A
-                    if tid is None and "id" in obj and (obj.get("contextId") or obj.get("context_id")):
-                        tid = obj.get("id")
-                        if tid is not None and cid is not None:
-                            return cid, str(tid)
-                    for key in ("result", "response", "task", "status"):
-                        if key in obj:
-                            found = _get_context_task(obj[key], _seen)
-                            if found[0] is not None and found[1] is not None:
-                                return found
-                    for v in obj.values():
-                        if isinstance(v, dict):
-                            found = _get_context_task(v, _seen)
-                            if found[0] is not None and found[1] is not None:
-                                return found
-                    return cid, tid
-                if isinstance(obj, str):
-                    try:
-                        parsed = json.loads(obj)
-                        return _get_context_task(parsed, _seen)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+            # Check top-level and common A2A wrappers (result, task, response); avoid deep recursion.
+            def _read_context_task(obj: dict[str, Any]) -> tuple[str | None, str | None]:
+                cid = obj.get("contextId") or obj.get("context_id")
+                tid = obj.get("taskId") or obj.get("task_id")
+                if tid is None and cid is not None and "id" in obj:
+                    tid = obj.get("id")
+                if cid is not None and tid is not None:
+                    return cid, str(tid)
                 return None, None
 
-            child_context_id, child_task_id = _get_context_task(response)
+            child_context_id, child_task_id = _read_context_task(response)
+            if (child_context_id, child_task_id) == (None, None):
+                for key in ("result", "task", "response"):
+                    val = response.get(key)
+                    if isinstance(val, dict):
+                        child_context_id, child_task_id = _read_context_task(val)
+                        if child_context_id is not None and child_task_id is not None:
+                            break
+                    elif isinstance(val, str):
+                        try:
+                            inner = json.loads(val)
+                            if isinstance(inner, dict):
+                                child_context_id, child_task_id = _read_context_task(inner)
+                                if child_context_id is not None and child_task_id is not None:
+                                    break
+                        except (json.JSONDecodeError, TypeError):
+                            pass
 
             # Store under tool_id (action_requests[0]["id"]) so UI/caller only sends tool_id for routing
             function_call_id = part.function_response.id
-            direct_child_agent_name = part.function_response.name
+            agent_name = part.function_response.name
             tool_id = first_request.get("id") if first_request else None
 
             logger.info(
-                f"Detected child agent HITL in event: direct_child={direct_child_agent_name}, "
+                f"Detected child agent HITL in event: direct_child={agent_name}, "
                 f"action_requests={len(action_requests)}, tool_id={tool_id}, "
                 f"child_context_id={child_context_id}, child_task_id={child_task_id}"
             )
@@ -731,7 +719,7 @@ class A2aAgentExecutor(AgentExecutor):
                 "task_id": child_task_id,
                 "action_requests": action_requests,
                 "function_call_id": function_call_id,
-                "direct_child_agent_name": direct_child_agent_name,
+                "agent_name": agent_name,
                 "tool_id": tool_id,
             }
 
@@ -751,28 +739,25 @@ class A2aAgentExecutor(AgentExecutor):
             session: The parent's session
             child_hitl: The extracted child HITL context
         """
-        if PENDING_CHILD_HITL_KEY not in session.state:
-            session.state[PENDING_CHILD_HITL_KEY] = {}
+        if PENDING_TOOL_CONFIRMATION_KEY not in session.state:
+            session.state[PENDING_TOOL_CONFIRMATION_KEY] = {}
 
-        # Key by tool_id so UI/A2A only sends tool_id for routing.
-        # Also key by function_call_id and direct_child_agent_name so cleanup can remove all aliases.
         tool_id = child_hitl.get("tool_id")
-        function_call_id = child_hitl["function_call_id"]
-        direct_child_agent_name = child_hitl["direct_child_agent_name"]
-        context_data = {
+        if not tool_id:
+            logger.warning("Child HITL has no tool_id, cannot store for routing")
+            return
+        session.state[PENDING_TOOL_CONFIRMATION_KEY][tool_id] = {
+            "type": "child",
             "context_id": child_hitl["context_id"],
             "task_id": child_hitl["task_id"],
             "action_requests": child_hitl["action_requests"],
-            "function_call_id": function_call_id,
-            "direct_child_agent_name": direct_child_agent_name,
+            "function_call_id": child_hitl["function_call_id"],
+            "agent_name": child_hitl["agent_name"],
+            "tool_id": tool_id,
         }
-        if tool_id:
-            session.state[PENDING_CHILD_HITL_KEY][tool_id] = context_data
-        session.state[PENDING_CHILD_HITL_KEY][function_call_id] = context_data
-        session.state[PENDING_CHILD_HITL_KEY][direct_child_agent_name] = context_data
 
         logger.info(
-            f"Stored child HITL context: tool_id={tool_id}, direct_child={direct_child_agent_name}, "
+            f"Stored child HITL context: tool_id={tool_id}, direct_child={child_hitl['agent_name']}, "
             f"context_id={child_hitl['context_id']}, task_id={child_hitl['task_id']}, session_id={session.id}"
         )
 
@@ -787,14 +772,14 @@ class A2aAgentExecutor(AgentExecutor):
     ) -> tuple[genai_types.Content | None, str | None]:
         """Forward a tool decision to the appropriate child (direct or nested).
 
-        Routes to direct_child_agent_name from stored context.
+        Routes to agent_name from stored context.
 
         Returns:
             (Content with child's response, response text) or (None, None) if failed.
         """
-        direct_child_agent_name = pending_child.get("direct_child_agent_name")
-        if not direct_child_agent_name:
-            logger.error("No direct_child_agent_name in pending child HITL context")
+        agent_name = pending_child.get("agent_name")
+        if not agent_name:
+            logger.error("No agent_name in pending child HITL context")
             return None, None
 
         child_context_id = pending_child.get("context_id")
@@ -806,7 +791,7 @@ class A2aAgentExecutor(AgentExecutor):
             return None, None
 
         logger.info(
-            f"Forwarding decision to direct child '{direct_child_agent_name}', "
+            f"Forwarding decision to direct child '{agent_name}', "
             f"context_id={child_context_id}, session_id={session.id}"
         )
 
@@ -815,20 +800,20 @@ class A2aAgentExecutor(AgentExecutor):
         from google.adk.tools.agent_tool import AgentTool
 
         for tool in runner.agent.tools:
-            if isinstance(tool, AgentTool) and tool.agent.name == direct_child_agent_name:
+            if isinstance(tool, AgentTool) and tool.agent.name == agent_name:
                 if isinstance(tool.agent, RemoteA2aAgent):
                     child_agent = tool.agent
                     break
 
         if not child_agent:
-            logger.error(f"Could not find RemoteA2aAgent for '{direct_child_agent_name}'")
+            logger.error(f"Could not find RemoteA2aAgent for '{agent_name}'")
             return None, None
 
         # Ensure the child agent is resolved (has HTTP client and agent card)
         try:
             await child_agent._ensure_resolved()
         except Exception as e:
-            logger.error(f"Failed to resolve child agent '{direct_child_agent_name}': {e}")
+            logger.error(f"Failed to resolve child agent '{agent_name}': {e}")
             return None, None
 
         # Build the decision message to send to child
@@ -839,16 +824,10 @@ class A2aAgentExecutor(AgentExecutor):
         for action_request in action_requests:
             tool_id = action_request.get("id")
 
-            decision_data = {
+            decision_parts.append(A2APart(DataPart(data={
                 KAGENT_HITL_DECISION_TYPE_KEY: tool_decision.decision_type,
                 "tool_id": tool_id,
-            }
-            # Include context_id/task_id so an intermediate agent can forward to the final child
-            if child_context_id:
-                decision_data["context_id"] = child_context_id
-            if child_task_id:
-                decision_data["task_id"] = child_task_id
-            decision_parts.append(A2APart(DataPart(data=decision_data)))
+            })))
 
         # Add a text summary
         decision_text = (
@@ -868,7 +847,7 @@ class A2aAgentExecutor(AgentExecutor):
         )
 
         logger.info(
-            f"Forwarding decision to '{direct_child_agent_name}': "
+            f"Forwarding decision to '{agent_name}': "
             f"{tool_decision.decision_type}, context_id={child_context_id}"
         )
 
@@ -944,12 +923,9 @@ class A2aAgentExecutor(AgentExecutor):
                         response_content = "\n".join(response_parts)
                         logger.info(f"Extracted response content from message: {len(response_content)} chars")
 
-            # Clear the pending child HITL context (we store under tool_id, function_call_id, direct_child_agent_name)
-            if PENDING_CHILD_HITL_KEY in session.state:
-                session.state[PENDING_CHILD_HITL_KEY].pop(lookup_key, None)
-                session.state[PENDING_CHILD_HITL_KEY].pop(pending_child.get("tool_id"), None)
-                session.state[PENDING_CHILD_HITL_KEY].pop(pending_child.get("function_call_id"), None)
-                session.state[PENDING_CHILD_HITL_KEY].pop(pending_child.get("direct_child_agent_name"), None)
+            # Clear the pending tool confirmation entry for this tool_id
+            if PENDING_TOOL_CONFIRMATION_KEY in session.state:
+                session.state[PENDING_TOOL_CONFIRMATION_KEY].pop(lookup_key, None)
             await runner.session_service.create_session(
                 app_name=runner.app_name,
                 user_id=session.user_id,
@@ -958,9 +934,9 @@ class A2aAgentExecutor(AgentExecutor):
             )
 
             if response_content:
-                logger.info(f"Successfully got response from child agent '{direct_child_agent_name}'")
+                logger.info(f"Successfully got response from child agent '{agent_name}'")
                 function_response = genai_types.FunctionResponse(
-                    name=direct_child_agent_name,
+                    name=agent_name,
                     id=pending_child.get("function_call_id"),
                     response={"result": response_content},
                 )
@@ -969,9 +945,9 @@ class A2aAgentExecutor(AgentExecutor):
                     parts=[genai_types.Part(function_response=function_response)],
                 ), response_content
 
-            logger.warning(f"No response content from child agent '{direct_child_agent_name}'")
+            logger.warning(f"No response content from child agent '{agent_name}'")
             return None, None
 
         except Exception as e:
-            logger.error(f"Failed to forward decision to child agent '{direct_child_agent_name}': {e}")
+            logger.error(f"Failed to forward decision to child agent '{agent_name}': {e}")
             return None, None

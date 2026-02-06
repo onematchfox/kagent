@@ -9,7 +9,7 @@ from google.genai import types as genai_types
 from kagent.core.a2a import KAGENT_HITL_DECISION_TYPE_APPROVE, ToolDecision
 
 from .part_converter import convert_a2a_part_to_genai_part
-from .._consts import ADK_CONFIRMATION_ID_BY_TOOL_ID_KEY, ADK_REQUEST_CONFIRMATION_NAME
+from .._consts import ADK_REQUEST_CONFIRMATION_NAME, PENDING_TOOL_CONFIRMATION_KEY
 
 logger = logging.getLogger("kagent_adk." + __name__)
 
@@ -67,10 +67,10 @@ def convert_tool_decision_to_adk_function_response(
         return None
 
     adk_confirmation_id = None
-
     if session and session.state:
-        by_tool_id = session.state.get(ADK_CONFIRMATION_ID_BY_TOOL_ID_KEY) or {}
-        adk_confirmation_id = by_tool_id.get(decision.tool_id)
+        pending = (session.state.get(PENDING_TOOL_CONFIRMATION_KEY) or {}).get(decision.tool_id)
+        if pending and pending.get("type") == "same_agent":
+            adk_confirmation_id = pending.get("adk_confirmation_id")
 
     if not adk_confirmation_id:
         logger.warning(
