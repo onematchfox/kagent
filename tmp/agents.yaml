@@ -1,0 +1,77 @@
+apiVersion: kagent.dev/v1alpha2
+kind: Agent
+metadata:
+  name: child-agent
+  namespace: kagent
+spec:
+  description: Agent with access to tool server that provides the current time.
+  type: Declarative
+  declarative:
+    systemMessage: |-
+      You are a helpful agent that assists others agents that need to get the
+      current time.
+    modelConfig: default-model-config
+    deployment:
+      env:
+        - name: LOG_LEVEL
+          value: DEBUG
+    tools:
+    - mcpServer:
+        name: kagent-tool-server
+        namespace: kagent
+        kind: RemoteMCPServer
+        apiGroup: kagent.dev
+        requireConfirmation: true
+        toolNames:
+        - datetime_get_current_time
+      type: McpServer
+---
+apiVersion: kagent.dev/v1alpha2
+kind: Agent
+metadata:
+  name: sub-agent
+  namespace: kagent
+spec:
+  description: Agent that can delegate to specialists
+  type: Declarative
+  declarative:
+    systemMessage: |-
+      You are a supervisor agent designed to route requests to a child agent.
+      Forward requests to the child agent available to you.
+    modelConfig: default-model-config
+    deployment:
+      env:
+        - name: LOG_LEVEL
+          value: DEBUG
+    tools:
+    - agent:
+        apiGroup: kagent.dev
+        kind: Agent
+        name: child-agent
+        namespace: kagent
+      type: Agent
+---
+apiVersion: kagent.dev/v1alpha2
+kind: Agent
+metadata:
+  name: parent-agent
+  namespace: kagent
+spec:
+  description: Agent that can delegate to specialists
+  type: Declarative
+  declarative:
+    systemMessage: |-
+      You are a supervisor agent designed to route requests to a child agent.
+      Forward requests to the child agent available to you.
+    modelConfig: default-model-config
+    deployment:
+      env:
+        - name: LOG_LEVEL
+          value: DEBUG
+    tools:
+    - agent:
+        apiGroup: kagent.dev
+        kind: Agent
+        name: sub-agent
+        namespace: kagent
+      type: Agent

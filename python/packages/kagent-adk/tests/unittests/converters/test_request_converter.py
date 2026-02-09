@@ -17,8 +17,7 @@ from kagent.core.a2a import (
 def _make_session(adk_confirmation_id_by_tool_id):
     """Mock session with state containing pending tool confirmation (same_agent entries)."""
     pending = {
-        tid: {"type": "same_agent", "adk_confirmation_id": cid}
-        for tid, cid in adk_confirmation_id_by_tool_id.items()
+        tid: {"type": "same_agent", "adk_confirmation_id": cid} for tid, cid in adk_confirmation_id_by_tool_id.items()
     }
     return SimpleNamespace(state={PENDING_TOOL_CONFIRMATION_KEY: pending})
 

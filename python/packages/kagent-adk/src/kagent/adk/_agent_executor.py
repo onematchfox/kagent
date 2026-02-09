@@ -360,6 +360,9 @@ class A2aAgentExecutor(AgentExecutor):
 
         tool_decision = extract_decision_from_message(context.message)
         if tool_decision:
+            # TODO: Simplify handling based on pending.type
+            # Line 459 duplicates the next lookup
+
             # Route by tool_id (UI/A2A sends only decision_type + tool_id)
             lookup_key = tool_decision.tool_id
             if lookup_key:
@@ -824,10 +827,16 @@ class A2aAgentExecutor(AgentExecutor):
         for action_request in action_requests:
             tool_id = action_request.get("id")
 
-            decision_parts.append(A2APart(DataPart(data={
-                KAGENT_HITL_DECISION_TYPE_KEY: tool_decision.decision_type,
-                "tool_id": tool_id,
-            })))
+            decision_parts.append(
+                A2APart(
+                    DataPart(
+                        data={
+                            KAGENT_HITL_DECISION_TYPE_KEY: tool_decision.decision_type,
+                            "tool_id": tool_id,
+                        }
+                    )
+                )
+            )
 
         # Add a text summary
         decision_text = (
@@ -847,8 +856,7 @@ class A2aAgentExecutor(AgentExecutor):
         )
 
         logger.info(
-            f"Forwarding decision to '{agent_name}': "
-            f"{tool_decision.decision_type}, context_id={child_context_id}"
+            f"Forwarding decision to '{agent_name}': {tool_decision.decision_type}, context_id={child_context_id}"
         )
 
         # Send the message via the child's A2A client
