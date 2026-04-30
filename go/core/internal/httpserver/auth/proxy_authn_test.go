@@ -168,7 +168,6 @@ func TestProxyAuthenticator_AgentCalls(t *testing.T) {
 		wantAgentID string
 		wantErr     bool
 	}{
-		// Bearer token path: agent must supply explicit user identity; SA sub is not used.
 		{
 			name: "agent with SA Bearer token and X-User-Id header uses header identity",
 			headers: map[string]string{
@@ -192,12 +191,13 @@ func TestProxyAuthenticator_AgentCalls(t *testing.T) {
 			wantAgentID: "myns/my-agent",
 		},
 		{
-			name: "agent with SA Bearer token but no user identity is rejected",
+			name: "agent with SA Bearer token but no X-User-Id falls back to SA sub",
 			headers: map[string]string{
 				"Authorization": "Bearer " + createTestJWT(map[string]any{"sub": "system:serviceaccount:myns:my-agent"}),
 				"X-Agent-Name":  "myns/my-agent",
 			},
-			wantErr: true,
+			wantUserID:  "system:serviceaccount:myns:my-agent",
+			wantAgentID: "myns/my-agent",
 		},
 		// Error cases.
 		{
@@ -205,14 +205,6 @@ func TestProxyAuthenticator_AgentCalls(t *testing.T) {
 			headers: map[string]string{
 				"X-Agent-Name": "myns/my-agent",
 				"X-User-Id":    "real-user@example.com",
-			},
-			wantErr: true,
-		},
-		{
-			name: "agent without any user identity is rejected",
-			headers: map[string]string{
-				"Authorization": "Bearer " + createTestJWT(map[string]any{"sub": "system:serviceaccount:myns:my-agent"}),
-				"X-Agent-Name":  "myns/my-agent",
 			},
 			wantErr: true,
 		},
