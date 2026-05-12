@@ -10,6 +10,7 @@ import (
 	"github.com/kagent-dev/kagent/go/core/internal/a2a"
 	"github.com/kagent-dev/kagent/go/core/internal/version"
 	"github.com/kagent-dev/kagent/go/core/pkg/auth"
+	"github.com/kagent-dev/kagent/go/core/pkg/env"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
@@ -87,11 +88,15 @@ func NewMCPHandler(kubeClient client.Client, agentClients *a2a.AgentClientRegist
 	)
 
 	// Create HTTP handler
+	var httpOpts *mcpsdk.StreamableHTTPOptions
+	if env.KagentMCPStateless.Get() {
+		httpOpts = &mcpsdk.StreamableHTTPOptions{Stateless: true}
+	}
 	handler.httpHandler = mcpsdk.NewStreamableHTTPHandler(
 		func(*http.Request) *mcpsdk.Server {
 			return server
 		},
-		nil,
+		httpOpts,
 	)
 
 	return handler, nil
