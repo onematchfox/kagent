@@ -31,7 +31,11 @@ type A2ARegistrar struct {
 	sandboxA2AURL  string
 	authenticator  auth.AuthProvider
 	a2aBaseOptions []a2aclient.Option
-	onAgentChange  func(ctx context.Context)
+	agentObserver  AgentObserver
+}
+
+type AgentObserver interface {
+	NotifyAgentsChanged(ctx context.Context)
 }
 
 var _ manager.Runnable = (*A2ARegistrar)(nil)
@@ -154,8 +158,8 @@ func (a *A2ARegistrar) registerAgentInformer(ctx context.Context, prototype v1al
 }
 
 func (a *A2ARegistrar) notifyAgentChange(ctx context.Context) {
-	if a.onAgentChange != nil {
-		a.onAgentChange(ctx)
+	if a.agentObserver != nil {
+		a.agentObserver.NotifyAgentsChanged(ctx)
 	}
 }
 
