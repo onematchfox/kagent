@@ -31,6 +31,8 @@ import { Message, DataPart, Task, TaskState } from "@a2a-js/sdk";
 
 // Task states where the agent is actively processing — resubscribe to live stream.
 const RESUBSCRIBE_TASK_STATES: TaskState[] = ["submitted", "working"];
+// Task states that mean the session is busy (used by the cross-tab send guard).
+const ACTIVE_TASK_STATES: TaskState[] = ["submitted", "working", "input-required"];
 
 interface ChatInterfaceProps {
   selectedAgentName: string;
@@ -212,6 +214,34 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
     }
 
     const userMessageText = currentInputMessage;
+
+    // Cross-tab guard: fetch the latest session state before mutating anything.
+    // Two cases: (1) another tab is still streaming — reconnect instead of sending;
+    // (2) another tab completed a turn we haven't loaded — reload so the user sees
+    // the full context before their next message goes out.
+    const guardSessionId = session?.id || sessionId;
+    if (guardSessionId) {
+      const tasksCheck = await getSessionTasks(guardSessionId);
+      if (tasksCheck.data) {
+        const inFlightTask = tasksCheck.data.findLast(
+          task => ACTIVE_TASK_STATES.includes(task.status?.state as TaskState)
+        );
+        if (inFlightTask) {
+          toast.info("This session is already being processed — reconnecting to live updates");
+          setChatStatus(mapA2AStateToStatus(inFlightTask.status?.state as TaskState));
+          await streamResubscribedTask(inFlightTask.id);
+          return;
+        }
+
+        const dbMessages = extractMessagesFromTasks(tasksCheck.data);
+        if (dbMessages.length > storedMessages.length) {
+          setStoredMessages(dbMessages);
+          setSessionStats(extractTokenStatsFromTasks(tasksCheck.data));
+          toast.info("New messages loaded — please review before sending");
+          return;
+        }
+      }
+    }
 
     setCurrentInputMessage("");
     setChatStatus("thinking");
