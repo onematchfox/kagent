@@ -227,16 +227,27 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
           task => ACTIVE_TASK_STATES.includes(task.status?.state as TaskState)
         );
         if (inFlightTask) {
-          toast.info("This session is already being processed — reconnecting to live updates");
-          setChatStatus(mapA2AStateToStatus(inFlightTask.status?.state as TaskState));
-          await streamResubscribedTask(inFlightTask.id);
+          if ((inFlightTask.status?.state as TaskState) === "input-required") {
+            // Another tab surfaced a pending approval — reload to show the HITL UI.
+            await reloadSessionFromDB();
+            toast.info("Session is awaiting your input — please review before sending");
+          } else {
+            toast.info("This session is already being processed — reconnecting to live updates");
+            setChatStatus(mapA2AStateToStatus(inFlightTask.status?.state as TaskState));
+            await streamResubscribedTask(inFlightTask.id);
+          }
           return;
         }
 
+        // Compare only non-approval messages to avoid false negatives when
+        // storedMessages includes appended ToolApprovalRequest / AskUserRequest entries.
         const dbMessages = extractMessagesFromTasks(tasksCheck.data);
-        if (dbMessages.length > storedMessages.length) {
-          setStoredMessages(dbMessages);
-          setSessionStats(extractTokenStatsFromTasks(tasksCheck.data));
+        const localMessageCount = storedMessages.filter(m => {
+          const meta = m.metadata as ADKMetadata | undefined;
+          return meta?.originalType !== "ToolApprovalRequest" && meta?.originalType !== "AskUserRequest";
+        }).length;
+        if (dbMessages.length > localMessageCount) {
+          await reloadSessionFromDB();
           toast.info("New messages loaded — please review before sending");
           return;
         }
@@ -503,7 +514,8 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
       }
     } finally {
       abortControllerRef.current = null;
-      setChatStatus("ready");
+      // Don't override input_required that reloadSessionFromDB() may have set.
+      setChatStatus(prev => prev === "input_required" ? prev : "ready");
       setIsStreaming(false);
       setStreamingContent("");
     }
@@ -548,12 +560,34 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
     displayText: string,
   ) => {
     const currentSessionId = session?.id || sessionId;
+
+    // Find the taskId first so the guard can verify the task is still input-required.
+    const { taskId: approvalTaskId } = getPendingApprovalToolIds();
+
+    // Cross-tab guard: another tab may have already submitted this approval.
+    if (currentSessionId && approvalTaskId) {
+      const tasksCheck = await getSessionTasks(currentSessionId);
+      if (tasksCheck.data) {
+        const approvalTask = tasksCheck.data.findLast(task => task.id === approvalTaskId);
+        if ((approvalTask?.status?.state as TaskState | undefined) !== "input-required") {
+          const inFlightTask = tasksCheck.data.findLast(
+            task => RESUBSCRIBE_TASK_STATES.includes(task.status?.state as TaskState)
+          );
+          if (inFlightTask) {
+            toast.info("Another tab already responded — reconnecting to live updates");
+            setChatStatus(mapA2AStateToStatus(inFlightTask.status?.state as TaskState));
+            await streamResubscribedTask(inFlightTask.id);
+          } else {
+            await reloadSessionFromDB();
+            toast.info("Session state changed — please review");
+          }
+          return;
+        }
+      }
+    }
+
     setChatStatus("thinking");
     setStreamingContent("");
-
-    // Find the taskId from the pending approval message so the A2A framework
-    // reuses the existing task instead of creating a new one.
-    const { taskId: approvalTaskId } = getPendingApprovalToolIds();
 
     // Stamp approvalDecision on the current pending approval messages so they
     // are excluded from getPendingApprovalToolIds on future HITL cycles.
@@ -689,8 +723,6 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
    */
   const handleAskUserSubmit = (answers: Array<{ answer: string[] }>) => {
     const currentSessionId = session?.id || sessionId;
-    setChatStatus("thinking");
-    setStreamingContent("");
 
     // Find the taskId from the pending AskUserRequest message
     let askUserTaskId: string | undefined;
@@ -702,6 +734,31 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
         break;
       }
     }
+
+    // Cross-tab guard: another tab may have already answered this question.
+    if (currentSessionId && askUserTaskId) {
+      const tasksCheck = await getSessionTasks(currentSessionId);
+      if (tasksCheck.data) {
+        const askTask = tasksCheck.data.findLast(task => task.id === askUserTaskId);
+        if ((askTask?.status?.state as TaskState | undefined) !== "input-required") {
+          const inFlightTask = tasksCheck.data.findLast(
+            task => RESUBSCRIBE_TASK_STATES.includes(task.status?.state as TaskState)
+          );
+          if (inFlightTask) {
+            toast.info("Another tab already responded — reconnecting to live updates");
+            setChatStatus(mapA2AStateToStatus(inFlightTask.status?.state as TaskState));
+            await streamResubscribedTask(inFlightTask.id);
+          } else {
+            await reloadSessionFromDB();
+            toast.info("Session state changed — please review");
+          }
+          return;
+        }
+      }
+    }
+
+    setChatStatus("thinking");
+    setStreamingContent("");
 
     // Stamp the ask-user message as resolved so we don't show the form again
     const stampAskUser = (msgs: Message[]) => msgs.map(m => {
