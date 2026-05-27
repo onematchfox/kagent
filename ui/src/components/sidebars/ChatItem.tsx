@@ -9,7 +9,7 @@ import {
   AlertDialogHeader,
   AlertDialogFooter,
 } from "@/components/ui/alert-dialog";
-import { MoreHorizontal, Trash2, Download } from "lucide-react";
+import { MoreHorizontal, Trash2, Download, Users } from "lucide-react";
 import { SidebarMenu, SidebarMenuAction, SidebarMenuButton, SidebarMenuItem } from "@/components/ui/sidebar";
 import Link from "next/link";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -25,9 +25,13 @@ interface ChatItemProps {
   activityAt?: string;
   /** When true, omit delete (e.g. Sandbox single-session agents). */
   hideDelete?: boolean;
+  /** Share token for sessions owned by another user; appended as ?share=<token>. */
+  shareToken?: string | null;
+  /** True when the share link that granted access is read-only. */
+  shareReadOnly?: boolean | null;
 }
 
-const ChatItem = ({ sessionId, agentName, agentNamespace, onDelete, sessionName, onDownload, activityAt, hideDelete }: ChatItemProps) => {
+const ChatItem = ({ sessionId, agentName, agentNamespace, onDelete, sessionName, onDownload, activityAt, hideDelete, shareToken, shareReadOnly }: ChatItemProps) => {
   const title = sessionName || "Untitled";
   
   // Format timestamp based on how recent it is
@@ -54,7 +58,8 @@ const ChatItem = ({ sessionId, agentName, agentNamespace, onDelete, sessionName,
       <SidebarMenu>
         <SidebarMenuItem key={sessionId}>
           <SidebarMenuButton asChild className="overflow-hidden relative group/chatitem">
-            <Link href={`/agents/${agentNamespace}/${agentName}/chat/${sessionId}`} className="flex items-center w-full">
+            <Link href={`/agents/${agentNamespace}/${agentName}/chat/${sessionId}${shareToken ? `?share=${shareToken}` : ""}`} className="flex items-center w-full">
+              {shareToken && <span title={shareReadOnly ? "Shared (read-only)" : "Shared session"}><Users className="h-3 w-3 shrink-0 mr-1 text-muted-foreground" /></span>}
               <span className="text-sm whitespace-nowrap" title={title}>{title}</span>
               <span className="absolute right-8 top-1/2 -translate-y-1/2 text-xs text-muted-foreground whitespace-nowrap pl-6"
                 style={{
