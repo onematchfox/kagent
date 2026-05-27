@@ -3,6 +3,7 @@ package a2a
 import (
 	"context"
 
+	pkgauth "github.com/kagent-dev/kagent/go/core/pkg/auth"
 	"trpc.group/trpc-go/trpc-a2a-go/client"
 	"trpc.group/trpc-go/trpc-a2a-go/protocol"
 	"trpc.group/trpc-go/trpc-a2a-go/taskmanager"
@@ -18,6 +19,24 @@ func NewPassthroughManager(client *client.A2AClient) taskmanager.TaskManager {
 	}
 }
 
+func injectInitiatedBy(ctx context.Context, msg *protocol.Message) {
+	if _, ok := pkgauth.ShareContextFrom(ctx); !ok {
+		return
+	}
+	session, ok := pkgauth.AuthSessionFrom(ctx)
+	if !ok {
+		return
+	}
+	userID := session.Principal().User.ID
+	if userID == "" {
+		return
+	}
+	if msg.Metadata == nil {
+		msg.Metadata = make(map[string]any)
+	}
+	msg.Metadata["initiated_by"] = userID
+}
+
 func (m *PassthroughManager) OnSendMessage(ctx context.Context, request protocol.SendMessageParams) (*protocol.MessageResult, error) {
 	if request.Message.MessageID == "" {
 		request.Message.MessageID = protocol.GenerateMessageID()
@@ -25,6 +44,7 @@ func (m *PassthroughManager) OnSendMessage(ctx context.Context, request protocol
 	if request.Message.Kind == "" {
 		request.Message.Kind = protocol.KindMessage
 	}
+	injectInitiatedBy(ctx, &request.Message)
 	return m.client.SendMessage(ctx, request)
 }
 
@@ -35,6 +55,7 @@ func (m *PassthroughManager) OnSendMessageStream(ctx context.Context, request pr
 	if request.Message.Kind == "" {
 		request.Message.Kind = protocol.KindMessage
 	}
+	injectInitiatedBy(ctx, &request.Message)
 	return m.client.StreamMessage(ctx, request)
 }
 

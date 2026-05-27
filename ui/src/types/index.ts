@@ -217,6 +217,10 @@ export interface Session {
   created_at: string;
   updated_at: string;
   deleted_at: string;
+  /** Populated for sessions owned by another user; use as X-Share-Token to access. */
+  share_token?: string | null;
+  /** True when the share link that granted access is read-only. */
+  share_read_only?: boolean | null;
 }
 
 export interface ToolsResponse {
