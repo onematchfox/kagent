@@ -21,6 +21,7 @@ type Handlers struct {
 	Model               *ModelHandler
 	ModelProviderConfig *ModelProviderConfigHandler
 	Sessions            *SessionsHandler
+	SessionShares       *SessionSharesHandler
 	Agents              *AgentsHandler
 	Tools               *ToolsHandler
 	ToolServers         *ToolServersHandler
@@ -81,6 +82,7 @@ func NewHandlers(
 		Model:               NewModelHandler(base),
 		ModelProviderConfig: NewModelProviderConfigHandler(base, rcnclr),
 		Sessions:            NewSessionsHandler(base),
+		SessionShares:       NewSessionSharesHandler(base),
 		Agents:              NewAgentsHandler(base),
 		Tools:               NewToolsHandler(base),
 		ToolServers:         NewToolServersHandler(base),
