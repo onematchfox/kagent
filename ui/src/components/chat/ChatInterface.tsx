@@ -528,7 +528,13 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
       };
     }
   ): Promise<"proceed" | "blocked"> => {
-    const tasksCheck = await getSessionTasks(guardSessionId);
+    let tasksCheck: Awaited<ReturnType<typeof getSessionTasks>>;
+    try {
+      tasksCheck = await getSessionTasks(guardSessionId);
+    } catch {
+      // Guard is best-effort: if the check fails, let the action proceed.
+      return "proceed";
+    }
     if (!tasksCheck.data) return "proceed";
 
     if (opts.expectedTaskId) {
