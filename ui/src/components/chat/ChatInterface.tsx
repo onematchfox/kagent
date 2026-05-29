@@ -221,37 +221,21 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
     // the full context before their next message goes out.
     const guardSessionId = session?.id || sessionId;
     if (guardSessionId) {
-      const tasksCheck = await getSessionTasks(guardSessionId);
-      if (tasksCheck.data) {
-        const inFlightTask = tasksCheck.data.findLast(
-          task => ACTIVE_TASK_STATES.includes(task.status?.state as TaskState)
-        );
-        if (inFlightTask) {
-          if ((inFlightTask.status?.state as TaskState) === "input-required") {
-            // Another tab surfaced a pending approval — reload to show the HITL UI.
-            await reloadSessionFromDB();
-            toast.info("Session is awaiting your input — please review before sending");
-          } else {
-            toast.info("This session is already being processed — reconnecting to live updates");
-            setChatStatus(mapA2AStateToStatus(inFlightTask.status?.state as TaskState));
-            await streamResubscribedTask(inFlightTask.id);
-          }
-          return;
-        }
-
-        // Compare only non-approval messages to avoid false negatives when
-        // storedMessages includes appended ToolApprovalRequest / AskUserRequest entries.
-        const dbMessages = extractMessagesFromTasks(tasksCheck.data);
-        const localMessageCount = storedMessages.filter(m => {
-          const meta = m.metadata as ADKMetadata | undefined;
-          return meta?.originalType !== "ToolApprovalRequest" && meta?.originalType !== "AskUserRequest";
-        }).length;
-        if (dbMessages.length > localMessageCount) {
-          await reloadSessionFromDB();
-          toast.info("New messages loaded — please review before sending");
-          return;
-        }
-      }
+      // Compare only non-approval messages to avoid false negatives when
+      // storedMessages includes appended ToolApprovalRequest / AskUserRequest entries.
+      const localMessageCount = storedMessages.filter(m => {
+        const meta = m.metadata as ADKMetadata | undefined;
+        return meta?.originalType !== "ToolApprovalRequest" && meta?.originalType !== "AskUserRequest";
+      }).length;
+      const guardResult = await checkAndSyncSessionBeforeAction(guardSessionId, {
+        localMessageCount,
+        messages: {
+          inFlight: "This session is already being processed — reconnecting to live updates",
+          inputRequired: "Session is awaiting your input — please review before sending",
+          staleOrChanged: "New messages loaded — please review before sending",
+        },
+      });
+      if (guardResult === "blocked") return;
     }
 
     setCurrentInputMessage("");
@@ -521,6 +505,78 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
     }
   };
 
+  /**
+   * Cross-tab guard: fetch the latest session state and sync before any action
+   * that would mutate the session. Returns "proceed" if safe, "blocked" if the
+   * action was superseded and the handler should return early.
+   *
+   * HITL mode (expectedTaskId provided): verifies the specific task is still
+   * input-required; resubscribes or reloads if another tab already responded.
+   *
+   * Send-guard mode (no expectedTaskId): checks for any active task and for
+   * stale local messages; blocks and syncs if either is detected.
+   */
+  const checkAndSyncSessionBeforeAction = async (
+    guardSessionId: string,
+    opts: {
+      expectedTaskId?: string;
+      localMessageCount?: number;
+      messages: {
+        inFlight: string;
+        inputRequired?: string;
+        staleOrChanged: string;
+      };
+    }
+  ): Promise<"proceed" | "blocked"> => {
+    const tasksCheck = await getSessionTasks(guardSessionId);
+    if (!tasksCheck.data) return "proceed";
+
+    if (opts.expectedTaskId) {
+      const expectedTask = tasksCheck.data.findLast(task => task.id === opts.expectedTaskId);
+      if ((expectedTask?.status?.state as TaskState | undefined) !== "input-required") {
+        const inFlightTask = tasksCheck.data.findLast(
+          task => RESUBSCRIBE_TASK_STATES.includes(task.status?.state as TaskState)
+        );
+        if (inFlightTask) {
+          toast.info(opts.messages.inFlight);
+          setChatStatus(mapA2AStateToStatus(inFlightTask.status?.state as TaskState));
+          await streamResubscribedTask(inFlightTask.id);
+        } else {
+          await reloadSessionFromDB();
+          toast.info(opts.messages.staleOrChanged);
+        }
+        return "blocked";
+      }
+      return "proceed";
+    }
+
+    const inFlightTask = tasksCheck.data.findLast(
+      task => ACTIVE_TASK_STATES.includes(task.status?.state as TaskState)
+    );
+    if (inFlightTask) {
+      if ((inFlightTask.status?.state as TaskState) === "input-required") {
+        await reloadSessionFromDB();
+        toast.info(opts.messages.inputRequired ?? opts.messages.staleOrChanged);
+      } else {
+        toast.info(opts.messages.inFlight);
+        setChatStatus(mapA2AStateToStatus(inFlightTask.status?.state as TaskState));
+        await streamResubscribedTask(inFlightTask.id);
+      }
+      return "blocked";
+    }
+
+    if (opts.localMessageCount !== undefined) {
+      const dbMessages = extractMessagesFromTasks(tasksCheck.data);
+      if (dbMessages.length > opts.localMessageCount) {
+        await reloadSessionFromDB();
+        toast.info(opts.messages.staleOrChanged);
+        return "blocked";
+      }
+    }
+
+    return "proceed";
+  };
+
   const handleCancel = (e: React.FormEvent) => {
     e.preventDefault();
 
@@ -566,24 +622,14 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
 
     // Cross-tab guard: another tab may have already submitted this approval.
     if (currentSessionId && approvalTaskId) {
-      const tasksCheck = await getSessionTasks(currentSessionId);
-      if (tasksCheck.data) {
-        const approvalTask = tasksCheck.data.findLast(task => task.id === approvalTaskId);
-        if ((approvalTask?.status?.state as TaskState | undefined) !== "input-required") {
-          const inFlightTask = tasksCheck.data.findLast(
-            task => RESUBSCRIBE_TASK_STATES.includes(task.status?.state as TaskState)
-          );
-          if (inFlightTask) {
-            toast.info("Another tab already responded — reconnecting to live updates");
-            setChatStatus(mapA2AStateToStatus(inFlightTask.status?.state as TaskState));
-            await streamResubscribedTask(inFlightTask.id);
-          } else {
-            await reloadSessionFromDB();
-            toast.info("Session state changed — please review");
-          }
-          return;
-        }
-      }
+      const guardResult = await checkAndSyncSessionBeforeAction(currentSessionId, {
+        expectedTaskId: approvalTaskId,
+        messages: {
+          inFlight: "Another tab already responded — reconnecting to live updates",
+          staleOrChanged: "Session state changed — please review",
+        },
+      });
+      if (guardResult === "blocked") return;
     }
 
     setChatStatus("thinking");
@@ -737,24 +783,14 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
 
     // Cross-tab guard: another tab may have already answered this question.
     if (currentSessionId && askUserTaskId) {
-      const tasksCheck = await getSessionTasks(currentSessionId);
-      if (tasksCheck.data) {
-        const askTask = tasksCheck.data.findLast(task => task.id === askUserTaskId);
-        if ((askTask?.status?.state as TaskState | undefined) !== "input-required") {
-          const inFlightTask = tasksCheck.data.findLast(
-            task => RESUBSCRIBE_TASK_STATES.includes(task.status?.state as TaskState)
-          );
-          if (inFlightTask) {
-            toast.info("Another tab already responded — reconnecting to live updates");
-            setChatStatus(mapA2AStateToStatus(inFlightTask.status?.state as TaskState));
-            await streamResubscribedTask(inFlightTask.id);
-          } else {
-            await reloadSessionFromDB();
-            toast.info("Session state changed — please review");
-          }
-          return;
-        }
-      }
+      const guardResult = await checkAndSyncSessionBeforeAction(currentSessionId, {
+        expectedTaskId: askUserTaskId,
+        messages: {
+          inFlight: "Another tab already responded — reconnecting to live updates",
+          staleOrChanged: "Session state changed — please review",
+        },
+      });
+      if (guardResult === "blocked") return;
     }
 
     setChatStatus("thinking");
