@@ -81,7 +81,6 @@ func TestListAgentsInputSchemaHasProperties(t *testing.T) {
 	require.Equal(t, false, schema["additionalProperties"], "additionalProperties must remain false")
 }
 
-
 // a2aBackend is a fake A2A server that records whether it was called.
 type a2aBackend struct {
 	server *httptest.Server
