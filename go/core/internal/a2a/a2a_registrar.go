@@ -43,17 +43,21 @@ var _ manager.Runnable = (*A2ARegistrar)(nil)
 func NewA2ARegistrar(
 	cache crcache.Cache,
 	mux A2AHandlerMux,
+	clientRegistry *AgentClientRegistry,
 	a2aBaseUrl string,
 	sandboxA2ABaseURL string,
 	authenticator auth.AuthProvider,
 	streamingMaxBuf int,
 	streamingInitialBuf int,
 	streamingTimeout time.Duration,
-) *A2ARegistrar {
+) (*A2ARegistrar, error) {
+	if clientRegistry == nil {
+		return nil, fmt.Errorf("clientRegistry must not be nil")
+	}
 	reg := &A2ARegistrar{
 		cache:          cache,
 		handlerMux:     mux,
-		clientRegistry: NewAgentClientRegistry(),
+		clientRegistry: clientRegistry,
 		a2aBaseURL:     a2aBaseUrl,
 		sandboxA2AURL:  sandboxA2ABaseURL,
 		authenticator:  authenticator,
@@ -64,7 +68,7 @@ func NewA2ARegistrar(
 		},
 	}
 
-	return reg
+	return reg, nil
 }
 
 func (a *A2ARegistrar) NeedLeaderElection() bool {

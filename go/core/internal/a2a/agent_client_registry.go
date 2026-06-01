@@ -52,7 +52,7 @@ func (r *AgentClientRegistry) SendMessage(ctx context.Context, namespace, name s
 	c, ok := r.clients[key]
 	r.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("agent %s/%s not registered", namespace, name)
+		return nil, fmt.Errorf("agent %s/%s not found or not ready", namespace, name)
 	}
 	return c.SendMessage(ctx, params)
 }
