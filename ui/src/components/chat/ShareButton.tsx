@@ -32,9 +32,14 @@ export default function ShareButton({ sessionId, namespace, agentName }: ShareBu
   const [share, setShare] = useState<SessionShare | null>(null);
   const [copied, setCopied] = useState(false);
   const [readOnly, setReadOnly] = useState(true);
+  const [origin, setOrigin] = useState("");
 
-  const shareUrl = share
-    ? `${window.location.origin}/agents/${namespace}/${agentName}/chat/${sessionId}?share=${share.token}`
+  useEffect(() => {
+    setOrigin(window.location.origin);
+  }, []);
+
+  const shareUrl = share && origin
+    ? `${origin}/agents/${namespace}/${agentName}/chat/${sessionId}?share=${share.token}`
     : null;
 
   useEffect(() => {
@@ -163,6 +168,7 @@ export default function ShareButton({ sessionId, namespace, agentName }: ShareBu
             <div className="flex items-center gap-2">
               <input
                 readOnly
+                aria-label="Share link"
                 value={shareUrl}
                 className="flex-1 rounded-md border bg-muted px-3 py-2 text-xs text-muted-foreground focus:outline-none"
               />
