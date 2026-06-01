@@ -150,6 +150,12 @@ func (h *SessionSharesHandler) HandleDeleteSessionShare(w ErrorResponseWriter, r
 		return
 	}
 
+	// Verify the session belongs to the caller before attempting deletion.
+	if _, err := h.DatabaseService.GetSession(r.Context(), sessionID, userID); err != nil {
+		w.RespondWithError(errors.NewNotFoundError("session not found", err))
+		return
+	}
+
 	if err := h.DatabaseService.DeleteSessionShare(r.Context(), token, sessionID, userID); err != nil {
 		w.RespondWithError(errors.NewInternalServerError("failed to delete share", err))
 		return
