@@ -128,6 +128,7 @@ export default function ChatInterface({ selectedAgentName, selectedNamespace, se
 
       setIsLoading(true);
       setSessionNotFound(false);
+      setShareReadOnly(false);
 
       let activeTask: Task | undefined;
 
