@@ -31,7 +31,8 @@ def _parse_app_name(app_name: str) -> tuple[str, str]:
 def _share_url(token: str, session_id: str, app_name: str) -> str:
     """Return the share URL for the current session.
 
-    Requires KAGENT_UI_URL to be set; without it only the raw token is returned.
+    When KAGENT_UI_URL is set, returns the full URL. Otherwise returns the
+    relative path ``/agents/<namespace>/<name>/chat/<session_id>?share=<token>``.
     """
     namespace, name = _parse_app_name(app_name)
     path = f"/agents/{namespace}/{name}/chat/{session_id}?share={token}"
