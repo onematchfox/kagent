@@ -50,6 +50,7 @@ func NewA2ARegistrar(
 	streamingMaxBuf int,
 	streamingInitialBuf int,
 	streamingTimeout time.Duration,
+	agentObserver AgentObserver,
 ) (*A2ARegistrar, error) {
 	if clientRegistry == nil {
 		return nil, fmt.Errorf("clientRegistry must not be nil")
@@ -66,6 +67,7 @@ func NewA2ARegistrar(
 			a2aclient.WithBuffer(streamingInitialBuf, streamingMaxBuf),
 			debugOpt(),
 		},
+		agentObserver: agentObserver,
 	}
 
 	return reg, nil
@@ -91,12 +93,6 @@ func (a *A2ARegistrar) Start(ctx context.Context) error {
 
 	<-ctx.Done()
 	return nil
-}
-
-// SetAgentObserver registers an observer notified whenever an agent is added,
-// updated, or removed.
-func (a *A2ARegistrar) SetAgentObserver(o AgentObserver) {
-	a.agentObserver = o
 }
 
 func (a *A2ARegistrar) registerAgentInformer(ctx context.Context, prototype v1alpha2.AgentObject, log logr.Logger) error {
