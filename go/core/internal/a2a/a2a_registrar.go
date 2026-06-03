@@ -93,12 +93,6 @@ func (a *A2ARegistrar) Start(ctx context.Context) error {
 	return nil
 }
 
-// ClientRegistry returns the registry of A2A clients for direct agent
-// invocation, populated as agents are registered and deregistered.
-func (a *A2ARegistrar) ClientRegistry() *AgentClientRegistry {
-	return a.clientRegistry
-}
-
 // SetAgentObserver registers an observer notified whenever an agent is added,
 // updated, or removed.
 func (a *A2ARegistrar) SetAgentObserver(o AgentObserver) {
