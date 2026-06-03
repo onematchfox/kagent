@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"maps"
+	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -282,6 +283,226 @@ func TestApplyDir_RollsBackWithExistingVersion(t *testing.T) {
 	}
 	if got := trackVersion(t, connStr, "schema_migrations"); got != 1 {
 		t.Errorf("version after rollback = %d, want 1 (rollback should happen when prevVersion > 0)", got)
+	}
+}
+
+// --- cross-version rolldown tests (stored DOWN scripts) ---
+
+// TestApplyDir_RollsDownWhenDBVersionAhead simulates a binary rollback: a newer binary
+// (goodCoreFS, v2) applied migrations and stored their DOWN scripts, then an older binary
+// (oneCoreFS, v1 max) starts. applyDir should detect the DB is ahead, roll down to v1
+// using the stored DOWN script for v2, then run Up (no-op).
+func TestApplyDir_RollsDownWhenDBVersionAhead(t *testing.T) {
+	connStr := startTestDB(t)
+
+	// Newer binary: apply 2 migrations, storing DOWN scripts for v1 and v2.
+	if _, err := applyDir(connStr, goodCoreFS, "core", "schema_migrations"); err != nil {
+		t.Fatalf("newer binary apply: %v", err)
+	}
+	if got := trackVersion(t, connStr, "schema_migrations"); got != 2 {
+		t.Fatalf("setup: version = %d, want 2", got)
+	}
+
+	// Older binary: only knows about v1. Should roll down from v2 to v1 using stored scripts.
+	prev, err := applyDir(connStr, oneCoreFS, "core", "schema_migrations")
+	if err != nil {
+		t.Fatalf("older binary apply: %v", err)
+	}
+	if prev != 1 {
+		t.Errorf("prevVersion = %d, want 1 (post-rolldown pre-Up version)", prev)
+	}
+	if got := trackVersion(t, connStr, "schema_migrations"); got != 1 {
+		t.Errorf("version after rolldown = %d, want 1", got)
+	}
+	// The v2 DOWN migration drops the name column; mig_test itself should still exist.
+	if !tableExists(t, connStr, "mig_test") {
+		t.Error("mig_test table should still exist after rolling down to v1")
+	}
+}
+
+// TestApplyDir_FailsWhenNoStoredScriptsAndDBVersionAhead verifies that rolldown fails
+// with a clear error when stored DOWN scripts are missing (e.g. the newer binary never ran,
+// or the table was dropped). This guards against silent data loss.
+func TestApplyDir_FailsWhenNoStoredScriptsAndDBVersionAhead(t *testing.T) {
+	connStr := startTestDB(t)
+
+	// Newer binary applies 2 migrations and stores DOWN scripts.
+	if _, err := applyDir(connStr, goodCoreFS, "core", "schema_migrations"); err != nil {
+		t.Fatalf("newer binary apply: %v", err)
+	}
+
+	// Simulate the stored DOWN scripts being unavailable.
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("DELETE FROM migration_down_scripts"); err != nil {
+		t.Fatalf("delete down scripts: %v", err)
+	}
+
+	// Older binary: no stored DOWN scripts available — should fail with a clear error.
+	_, err = applyDir(connStr, oneCoreFS, "core", "schema_migrations")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "no stored DOWN scripts") {
+		t.Errorf("expected 'no stored DOWN scripts' in error, got: %v", err)
+	}
+	// DB should still be at v2 — rolldown was not attempted.
+	if got := trackVersion(t, connStr, "schema_migrations"); got != 2 {
+		t.Errorf("version = %d, want 2 (unchanged after failed rolldown)", got)
+	}
+}
+
+// TestMigrateLockIDMatchesGoMigrate verifies that migrateLockID computes the same
+// advisory lock ID as golang-migrate's pgx v5 driver. It does this by holding our
+// computed lock on one connection and asserting that a concurrent applyDir (which
+// calls golang-migrate's Up() internally) blocks until the lock is released.
+//
+// If golang-migrate changes its lock ID formula, this test will fail because
+// applyDir will complete in the blocked window instead of waiting.
+func TestMigrateLockIDMatchesGoMigrate(t *testing.T) {
+	connStr := startTestDB(t)
+
+	lockID, err := migrateLockID(connStr, "schema_migrations")
+	if err != nil {
+		t.Fatalf("compute lock ID: %v", err)
+	}
+
+	// Hold the lock on a dedicated connection.
+	lockDB, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("open lock db: %v", err)
+	}
+	defer lockDB.Close()
+	lockConn, err := lockDB.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("acquire lock connection: %v", err)
+	}
+	defer lockConn.Close()
+
+	if _, err := lockConn.ExecContext(context.Background(), "SELECT pg_advisory_lock($1)", lockID); err != nil {
+		t.Fatalf("acquire advisory lock: %v", err)
+	}
+
+	// Run applyDir in a goroutine. golang-migrate's Up() will try to acquire the same
+	// advisory lock and must block until we release ours.
+	done := make(chan error, 1)
+	go func() {
+		_, err := applyDir(connStr, oneCoreFS, "core", "schema_migrations")
+		done <- err
+	}()
+
+	// Poll pg_locks until we see an ungranted advisory lock, which means the goroutine
+	// has reached pg_advisory_lock and is blocked. This is deterministic and adds no
+	// unnecessary delay — we release as soon as the wait is confirmed.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for applyDir to block on advisory lock — lock ID mismatch?")
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("applyDir completed without blocking — lock ID mismatch (err: %v)", err)
+		default:
+		}
+		var waiting bool
+		_ = lockDB.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)`,
+		).Scan(&waiting)
+		if waiting {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Release our lock — applyDir should now proceed and complete successfully.
+	if _, err := lockConn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", lockID); err != nil {
+		t.Fatalf("release advisory lock: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("applyDir failed after lock released: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("applyDir did not complete after advisory lock was released")
+	}
+}
+
+// --- unit tests (no DB required) ---
+
+func TestMaxEmbeddedVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		fs      fstest.MapFS
+		dir     string
+		want    uint
+		wantErr bool
+	}{
+		{
+			name: "returns highest version across up and down files",
+			fs: fstest.MapFS{
+				"core/000001_a.up.sql":   {},
+				"core/000001_a.down.sql": {},
+				"core/000003_b.up.sql":   {},
+				"core/000003_b.down.sql": {},
+			},
+			dir:  "core",
+			want: 3,
+		},
+		{
+			name:    "empty dir returns error",
+			fs:      fstest.MapFS{"core/.keep": {}},
+			dir:     "core",
+			wantErr: true,
+		},
+		{
+			name:    "nonexistent dir returns error",
+			fs:      fstest.MapFS{},
+			dir:     "missing",
+			wantErr: true,
+		},
+		{
+			name: "files with non-numeric names are skipped",
+			fs: fstest.MapFS{
+				"core/README.md":        {},
+				"core/000002_x.up.sql":  {},
+				"core/000002_x.down.sql": {},
+			},
+			dir:  "core",
+			want: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := maxEmbeddedVersion(tt.fs, tt.dir)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("maxEmbeddedVersion() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Errorf("maxEmbeddedVersion() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestComputeMigrateLockID(t *testing.T) {
+	a := computeMigrateLockID("db", "public", "schema_migrations")
+	b := computeMigrateLockID("db", "public", "vector_schema_migrations")
+	if a == b {
+		t.Error("different tables must produce different lock IDs")
+	}
+	// Argument-order sanity: swapping dbName and schemaName must change the result.
+	c := computeMigrateLockID("public", "db", "schema_migrations")
+	if a == c {
+		t.Error("swapping dbName and schemaName must change the lock ID")
+	}
+	// Deterministic: same inputs always produce the same output.
+	if got := computeMigrateLockID("db", "public", "schema_migrations"); got != a {
+		t.Errorf("computeMigrateLockID not deterministic: got %d, want %d", got, a)
 	}
 }
 
