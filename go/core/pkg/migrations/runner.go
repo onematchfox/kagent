@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
 	migratepgx "github.com/golang-migrate/migrate/v4/database/pgx/v5"
@@ -56,11 +57,28 @@ func applyDir(url string, migrationsFS fs.FS, dir, migrationsTable string) (prev
 	}
 	defer closeMigrate(dir, mg)
 
-	prevVersion, _, err = mg.Version()
+	var dirty bool
+	prevVersion, dirty, err = mg.Version()
 	if err != nil && !errors.Is(err, migrate.ErrNilVersion) {
 		return 0, fmt.Errorf("get pre-migration version for %s: %w", dir, err)
 	}
 	// prevVersion == 0 when ErrNilVersion (no migrations applied yet).
+
+	// If the database is ahead of this binary's max known version, skip Up
+	// entirely. The expand-then-contract policy in database-migrations.md
+	// guarantees that each release's code is compatible with the schema applied
+	// by the previous release, so rolling back one release at a time is safe.
+	// We cannot enforce a tighter constraint here because migration version
+	// numbers don't align with release versions.
+	// A dirty database is excluded: dirty state means a previous migration
+	// attempt failed and must be resolved, not silently accepted.
+	if maxVer, scanErr := maxEmbeddedVersion(migrationsFS, dir); scanErr != nil {
+		log.Error(scanErr, "could not determine max embedded migration version; proceeding with Up", "track", dir)
+	} else if prevVersion > maxVer && !dirty {
+		log.Info("database schema is ahead of this binary; running in compatibility mode",
+			"track", dir, "dbVersion", prevVersion, "binaryMax", maxVer)
+		return prevVersion, nil
+	}
 
 	if upErr := mg.Up(); upErr != nil {
 		if errors.Is(upErr, migrate.ErrNoChange) {
@@ -184,6 +202,41 @@ func newMigrate(url string, migrationsFS fs.FS, dir, migrationsTable string) (*m
 		return nil, fmt.Errorf("create migrator for %s: %w", dir, err)
 	}
 	return mg, nil
+}
+
+// maxEmbeddedVersion scans dir inside migrationsFS and returns the highest migration
+// version number found. Only files with a ".up.sql" suffix are considered. Version
+// numbers are the leading decimal digits in filenames of the form
+// "NNNNNN_description.up.sql". Returns an error if the directory cannot be read or
+// contains no recognisable migration files.
+func maxEmbeddedVersion(migrationsFS fs.FS, dir string) (uint, error) {
+	entries, err := fs.ReadDir(migrationsFS, dir)
+	if err != nil {
+		return 0, fmt.Errorf("read migration dir %s: %w", dir, err)
+	}
+	var highest uint
+	var foundUpSQL, foundVersioned bool
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".up.sql") {
+			continue
+		}
+		foundUpSQL = true
+		var v uint
+		if _, scanErr := fmt.Sscanf(e.Name(), "%d", &v); scanErr != nil {
+			continue
+		}
+		foundVersioned = true
+		if v > highest {
+			highest = v
+		}
+	}
+	if !foundUpSQL {
+		return 0, fmt.Errorf("no .up.sql migration files found in %s", dir)
+	}
+	if !foundVersioned {
+		return 0, fmt.Errorf("no versioned .up.sql migration files found in %s; expected names like 000001_description.up.sql", dir)
+	}
+	return highest, nil
 }
 
 // closeMigrate closes mg, logging source and database close errors separately.
