@@ -22,6 +22,11 @@ import (
 	"trpc.group/trpc-go/trpc-a2a-go/server"
 )
 
+// configHashAnnotation is set on the agent pod template so a change to
+// the serialized config Secret (including tool URLs and ModelConfig/RMS
+// Secret rotations folded in via Status hashes) rolls the pod.
+const configHashAnnotation = "kagent.dev/config-hash"
+
 type manifestContext struct {
 	agent          v1alpha2.AgentObject
 	deployment     *resolvedDeployment
@@ -478,7 +483,7 @@ func buildPodTemplate(
 	if podTemplateAnnotations == nil {
 		podTemplateAnnotations = map[string]string{}
 	}
-	podTemplateAnnotations["kagent.dev/config-hash"] = fmt.Sprintf("%d", configHash)
+	podTemplateAnnotations[configHashAnnotation] = fmt.Sprintf("%d", configHash)
 
 	probeConf := getRuntimeProbeConfig(agentRuntime(manifestCtx.agent.GetAgentSpec()))
 
