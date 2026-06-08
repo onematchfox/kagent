@@ -343,6 +343,8 @@ export interface DeclarativeAgentSpec {
   memory?: MemorySpec;
   /** When set, systemMessage is rendered as a Go text/template with includes and variables. */
   promptTemplate?: PromptTemplateSpec;
+  /** When true, the agent gains built-in share link tools (create/list/delete share tokens). */
+  shareTools?: boolean;
 }
 
 export interface ContextConfig {
