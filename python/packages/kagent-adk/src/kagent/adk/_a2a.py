@@ -5,8 +5,8 @@ import os
 from typing import Any, Callable, List, Optional
 
 import httpx
-from a2a.server.apps import A2AFastAPIApplication
-from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.request_handlers import DefaultRequestHandlerV2
+from a2a.server.routes import add_a2a_routes_to_fastapi, create_agent_card_routes, create_jsonrpc_routes
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCard
 from agentsts.adk import ADKSTSIntegration, ADKTokenPropagationPlugin
@@ -21,6 +21,7 @@ from google.adk.runners import Runner
 from google.adk.sessions import DatabaseSessionService, InMemorySessionService
 from google.genai import types
 from kagent.core.a2a import (
+    A2ARequestSizeLimitMiddleware,
     KAgentRequestContextBuilder,
     KAgentTaskStore,
     get_a2a_max_content_length,
@@ -162,17 +163,11 @@ class KAgentApp:
         )
 
         request_context_builder = KAgentRequestContextBuilder(task_store=task_store)
-        request_handler = DefaultRequestHandler(
+        request_handler = DefaultRequestHandlerV2(
             agent_executor=agent_executor,
             task_store=task_store,
-            request_context_builder=request_context_builder,
-        )
-
-        max_content_length = get_a2a_max_content_length()
-        a2a_app = A2AFastAPIApplication(
             agent_card=self.agent_card,
-            http_handler=request_handler,
-            max_content_length=max_content_length,
+            request_context_builder=request_context_builder,
         )
 
         faulthandler.enable()
@@ -183,11 +178,19 @@ class KAgentApp:
             lifespan_manager.add(token_service.lifespan())
 
         app = FastAPI(lifespan=lifespan_manager)
+        app.add_middleware(
+            A2ARequestSizeLimitMiddleware,
+            max_content_length=get_a2a_max_content_length(),
+        )
 
         # Health check/readiness probe
         app.add_route("/health", methods=["GET"], route=health_check)
         app.add_route("/thread_dump", methods=["GET"], route=thread_dump)
-        a2a_app.add_routes_to_app(app)
+        add_a2a_routes_to_fastapi(
+            app,
+            agent_card_routes=create_agent_card_routes(self.agent_card),
+            jsonrpc_routes=create_jsonrpc_routes(request_handler, rpc_url="/"),
+        )
 
         return app
 
