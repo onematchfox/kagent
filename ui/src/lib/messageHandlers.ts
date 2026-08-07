@@ -16,17 +16,23 @@ import {
   isDataPart,
   isTextPart,
   isUserRole,
-  type DataPart,
 } from "@/lib/utils";
 import type {
-  ApprovalDecision,
-  AdkRequestConfirmationData,
   ChatStatus,
-  HitlPartInfo,
+  HitlRequestPayload,
+  HitlResponsePayload,
   TokenStats,
-  ToolDecision,
 } from "@/types";
 import { mapA2AStateToStatus } from "@/lib/statusUtils";
+import {
+  buildHitlCard,
+  getHitlPayload,
+  isHitlRequest,
+  isHitlResponse,
+  relatedHitlCallIds,
+  responseMatchesRequest,
+  visibleHitlTools,
+} from "@/lib/hitl";
 
 function isInputRequiredState(state: TaskState | undefined): boolean {
   return state === TaskState.TASK_STATE_INPUT_REQUIRED;
@@ -177,8 +183,8 @@ function appendArtifactMessages(
     const hitl = historicalHitlByCallId.get(callId);
     if (!hitl) return false;
     if (!emittedHistoricalHitl.has(hitl)) {
-      messages.push(buildApprovalMessage(hitl.confirmation, task.contextId, task.id, {
-        decisionData: hitl.decision,
+      messages.push(...buildHitlMessagesFromPayload(hitl.requestPayload, task.contextId, task.id, {
+        response: hitl.response,
       }));
       emittedHistoricalHitl.add(hitl);
     }
@@ -189,8 +195,8 @@ function appendArtifactMessages(
     if (!callId) return;
     const hitl = historicalHitlByCallId.get(callId);
     if (!hitl || emittedHistoricalHitl.has(hitl)) return;
-    messages.push(buildApprovalMessage(hitl.confirmation, task.contextId, task.id, {
-      decisionData: hitl.decision,
+    messages.push(...buildHitlMessagesFromPayload(hitl.requestPayload, task.contextId, task.id, {
+      response: hitl.response,
     }));
     emittedHistoricalHitl.add(hitl);
   };
@@ -208,7 +214,7 @@ function appendArtifactMessages(
 
       if (partType === "function_call" && data) {
         const toolData = data as unknown as ToolCallData;
-        if (toolData.name === "adk_request_confirmation" || toolData.name === "adk_request_credential") {
+        if (toolData.name === "adk_request_credential") {
           continue;
         }
         flushText();
@@ -335,18 +341,14 @@ function aggregatePartsToDisplayText(parts: Part[]): string {
 
 /** Returns true if the message is a user HITL decision (approve/reject) or ask-user answer. */
 function isUserDecisionMessage(message: Message): boolean {
-  if (!isUserRole(message.role) || !message.parts) return false;
-  return message.parts.some((p: Part) => {
-    if (!isDataPart(p)) return false;
-    const data = p.content.value as Record<string, unknown> | undefined;
-    return data?.decision_type != null;
-  });
+  if (!isUserRole(message.role)) return false;
+  const payload = getHitlPayload(message);
+  return payload !== undefined && isHitlResponse(payload);
 }
 
 /**
- * Check tasks for pending ADK confirmation requests (task still in
- * input-required state) and create ToolApprovalRequest messages with
- * Approve/Reject buttons.
+ * Check tasks for pending HITL requests (task still in input-required state)
+ * and create typed hitlCard messages with Approve/Reject buttons.
  *
  * Historical status messages are intentionally not reconstructed here because
  * A2A task snapshots do not define their order relative to artifacts.
@@ -359,202 +361,87 @@ export function extractApprovalMessagesFromTasks(tasks: Task[]): { messages: Mes
     const status = task.status;
     if (!isInputRequiredState(status?.state) || !status?.message) continue;
 
-    const confirmationParts = findConfirmationParts(status.message as Message);
-    if (confirmationParts.length === 0) continue;
-
-    for (const confPart of confirmationParts) {
-      approvalMessages.push(buildApprovalMessage(confPart, task.contextId, task.id));
-    }
+    const payload = getHitlPayload(status.message as Message);
+    if (!payload || !isHitlRequest(payload)) continue;
+    approvalMessages.push(...buildHitlMessagesFromPayload(payload, task.contextId, task.id));
     hasPending = true;
   }
 
   return { messages: approvalMessages, hasPendingApproval: hasPending };
 }
 
-/** Find adk_request_confirmation DataParts in a message's parts. */
-function findConfirmationParts(message: Message): DataPart[] {
-  if (!message.parts) return [];
-  return message.parts.filter((part: Part) => {
-    if (!isDataPart(part)) return false;
-    const meta = part.metadata as Record<string, unknown> | undefined;
-    return (
-      getMetadataValue<string>(meta, "type") === "function_call" &&
-      getMetadataValue<boolean>(meta, "is_long_running") === true &&
-      (part.content.value as Record<string, unknown>)?.name === "adk_request_confirmation"
-    );
-  }) as DataPart[];
+function buildApprovalMessageFromPayload(payload: HitlRequestPayload, contextId: string | undefined, taskId: string | undefined, options: BuildApprovalMessageOptions = {}): Message {
+  const { response, tokenStats } = options;
+  return createMessage("", "agent", {
+    contextId,
+    taskId,
+    additionalMetadata: { hitlCard: buildHitlCard(payload, response), ...(tokenStats && { tokenStats }) },
+  });
 }
 
-/** Collect original tool-call IDs represented by a confirmation DataPart. */
-function collectHitlOriginalCallIds(confPart: DataPart, into: Set<string>): void {
-  const data = confPart.content.value as unknown as AdkRequestConfirmationData | undefined;
-  const origId = data?.args?.originalFunctionCall?.id;
-  if (origId) into.add(origId);
-  for (const hp of data?.args?.toolConfirmation?.payload?.hitl_parts ?? []) {
-    const nestedId = hp.originalFunctionCall?.id;
-    if (nestedId) into.add(nestedId);
-  }
+/** Build the parent AgentCall card whose activity panel opens the paused child session. */
+function buildNestedAgentCallMessage(payload: HitlRequestPayload, contextId: string | undefined, taskId: string | undefined): Message | undefined {
+  const nested = payload.nested;
+  if (!nested?.context_id || !nested.subagent_name) return undefined;
+
+  // Nested ask_user leaves the parent agent call in the transcript (its call id
+  // is not in relatedHitlCallIds). A synthetic card keyed by payload.id would
+  // render a second "Delegating" box beside the real Completed/pending one.
+  if (payload.type !== "tool_approval_request") return undefined;
+
+  const parentTool =
+    payload.tools.find(tool => tool.name === nested.subagent_name) ??
+    payload.tools.find(tool => isAgentToolName(tool.name)) ??
+    payload.tools[0];
+  return createMessage("", "agent", {
+    originalType: "ToolCallRequestEvent",
+    contextId,
+    taskId,
+    additionalMetadata: {
+      toolCallData: [{
+        id: parentTool?.call_id ?? nested.context_id,
+        name: parentTool?.name ?? nested.subagent_name,
+        args: parentTool?.args ?? {},
+        subagent_session_id: nested.context_id,
+      }],
+    },
+  });
+}
+
+function buildHitlMessagesFromPayload(payload: HitlRequestPayload, contextId: string | undefined, taskId: string | undefined, options: BuildApprovalMessageOptions = {}): Message[] {
+  const approvalMessage = buildApprovalMessageFromPayload(payload, contextId, taskId, options);
+  const agentCallMessage = buildNestedAgentCallMessage(payload, contextId, taskId);
+  return agentCallMessage ? [agentCallMessage, approvalMessage] : [approvalMessage];
 }
 
 interface HistoricalHitl {
-  confirmation: DataPart;
-  decision: Record<string, unknown>;
+  requestPayload: HitlRequestPayload;
+  response: HitlResponsePayload;
 }
 
 /** Index resolved history-only HITL interactions by the tool call they govern. */
 function indexHistoricalHitlByCallId(history: Message[]): Map<string, HistoricalHitl> {
   const byCallId = new Map<string, HistoricalHitl>();
   for (let i = 0; i < history.length; i++) {
-    const decision = findDecisionAfterIndex(history, i);
-    if (!decision) continue;
-    for (const confirmation of findConfirmationParts(history[i])) {
-      const callIds = new Set<string>();
-      collectHitlOriginalCallIds(confirmation, callIds);
-      const hitl = { confirmation, decision };
-      for (const callId of callIds) {
-        byCallId.set(callId, hitl);
-      }
+    const requestPayload = getHitlPayload(history[i]);
+    if (!requestPayload || !isHitlRequest(requestPayload)) continue;
+    const response = history
+      .slice(i + 1)
+      .map(getHitlPayload)
+      .find((payload): payload is HitlResponsePayload =>
+        payload !== undefined && isHitlResponse(payload) && responseMatchesRequest(requestPayload, payload));
+    if (!response) continue;
+    const hitl: HistoricalHitl = { requestPayload, response };
+    for (const callId of relatedHitlCallIds(requestPayload)) {
+      byCallId.set(callId, hitl);
     }
   }
   return byCallId;
 }
 
-/** Find the first user HITL decision following a confirmation message. */
-function findDecisionAfterIndex(
-  history: Message[],
-  startIndex: number,
-): Record<string, unknown> | undefined {
-  for (let i = startIndex + 1; i < history.length; i++) {
-    const item = history[i];
-    if (!isUserRole(item.role) || !item.parts) continue;
-    for (const part of item.parts) {
-      if (!isDataPart(part)) continue;
-      const data = part.content.value as Record<string, unknown> | undefined;
-      if (data?.decision_type != null) return data;
-    }
-  }
-  return undefined;
-}
-
-function resolveToolDecision(
-  decisionData: Record<string, unknown> | undefined,
-  toolId: string,
-): ToolDecision | undefined {
-  if (!decisionData) return undefined;
-  if (decisionData.decision_type === "batch") {
-    return (decisionData.decisions as Record<string, ToolDecision> | undefined)?.[toolId];
-  }
-  return decisionData.decision_type as ToolDecision;
-}
-
 interface BuildApprovalMessageOptions {
-  decisionData?: Record<string, unknown>;
+  response?: HitlResponsePayload;
   tokenStats?: TokenStats;
-}
-
-/**
- * Build a confirmation message from an adk_request_confirmation DataPart.
- * Branches on the original function call name:
- *   - "ask_user" → AskUserRequest message
- *   - everything else → ToolApprovalRequest message
- */
-export function buildApprovalMessage(
-  confPart: DataPart,
-  contextId: string | undefined,
-  taskId: string | undefined,
-  options: BuildApprovalMessageOptions = {},
-): Message {
-  const { decisionData, tokenStats } = options;
-  const data = confPart.content.value as unknown as AdkRequestConfirmationData;
-  const origFc = data.args.originalFunctionCall;
-  const toolId = origFc.id || data.id;
-
-  // ask_user tool uses a dedicated UI card
-  if (origFc.name === "ask_user") {
-    const askUserAnswers = decisionData?.ask_user_answers as Array<{ answer: string[] }> | undefined;
-    return createMessage("", "agent", {
-      originalType: "AskUserRequest",
-      contextId,
-      taskId,
-      additionalMetadata: {
-        askUserData: {
-          id: toolId,
-          questions: (origFc.args as { questions?: unknown }).questions || [],
-        },
-        askUserAnswers: askUserAnswers ?? null,
-        approvalDecision: decisionData?.decision_type ? "approve" : undefined,
-        ...(tokenStats && { tokenStats }),
-      },
-    });
-  }
-
-  // Check for inner subagent tool details in toolConfirmation.payload.hitl_parts.
-  // When a subagent's tool needs approval, KAgentRemoteA2ATool stores the
-  // subagent's adk_request_confirmation DataParts in the payload so we can
-  // show the actual inner tool(s) instead of the generic "call subagent" request.
-  const hitlParts: HitlPartInfo[] | undefined = data.args.toolConfirmation?.payload?.hitl_parts;
-
-  // Subagent ask_user: if the only inner tool is ask_user, render the
-  // AskUserDisplay instead of a generic approval card.
-  if (hitlParts && hitlParts.length === 1 && hitlParts[0].originalFunctionCall.name === "ask_user") {
-    const innerFc = hitlParts[0].originalFunctionCall;
-    const innerToolId = innerFc.id || hitlParts[0].id || toolId;
-    const askUserAnswers = decisionData?.ask_user_answers as Array<{ answer: string[] }> | undefined;
-    const subagentNameForAskUser: string | undefined = data.args.toolConfirmation?.payload?.subagent_name;
-    return createMessage("", "agent", {
-      originalType: "AskUserRequest",
-      contextId,
-      taskId,
-      additionalMetadata: {
-        askUserData: {
-          id: innerToolId,
-          questions: (innerFc.args as { questions?: unknown }).questions || [],
-        },
-        askUserAnswers: askUserAnswers ?? null,
-        approvalDecision: decisionData?.decision_type ? "approve" : undefined,
-        subagentName: subagentNameForAskUser,
-        ...(tokenStats && { tokenStats }),
-      },
-    });
-  }
-
-  let approvalDecision: ApprovalDecision | undefined;
-  if (hitlParts && hitlParts.length > 0 && decisionData?.decision_type === "batch") {
-    approvalDecision = decisionData.decisions as Record<string, ToolDecision> | undefined;
-  } else {
-    approvalDecision = resolveToolDecision(decisionData, toolId);
-  }
-
-  let toolCallContent: ProcessedToolCallData[];
-
-  if (hitlParts && hitlParts.length > 0) {
-    toolCallContent = hitlParts.map((hp: HitlPartInfo) => ({
-      id: hp.originalFunctionCall.id || hp.id || toolId,
-      name: hp.originalFunctionCall.name || origFc.name,
-      args: hp.originalFunctionCall.args || {},
-    }));
-  } else {
-    toolCallContent = [{
-      id: toolId,
-      name: origFc.name,
-      args: origFc.args || {},
-    }];
-  }
-
-  // Extract subagent name if this is a subagent HITL request
-  const subagentName: string | undefined = data.args.toolConfirmation?.payload?.subagent_name;
-
-  return createMessage("", "agent", {
-    originalType: "ToolApprovalRequest",
-    contextId,
-    taskId,
-    additionalMetadata: {
-      toolCallData: toolCallContent,
-      approvalDecision,
-      subagentName,
-      ...(tokenStats && { tokenStats }),
-    },
-  });
 }
 
 /**
@@ -619,9 +506,7 @@ export type OriginalMessageType =
   | "TextMessage"
   | "ToolCallRequestEvent"
   | "ToolCallExecutionEvent"
-  | "ToolCallSummaryMessage"
-  | "ToolApprovalRequest"
-  | "AskUserRequest";
+  | "ToolCallSummaryMessage";
 
 export interface ADKMetadata {
   kagent_app_name?: string;
@@ -636,6 +521,7 @@ export interface ADKMetadata {
   kagent_author?: string;
   kagent_invocation_id?: string;
   originalType?: OriginalMessageType;
+  hitlCard?: import("@/lib/hitl").HitlCard;
   displaySource?: string;
   toolCallData?: ProcessedToolCallData[];
   toolResultData?: ProcessedToolResultData[];
@@ -680,6 +566,7 @@ export interface ProcessedToolCallData {
   id: string;
   name: string;
   args: Record<string, unknown>;
+  subagent_session_id?: string;
 }
 
 export interface ProcessedToolResultData {
@@ -1006,7 +893,7 @@ export const createMessageHandlers = (handlers: MessageHandlers) => {
         if (isUserRole(updated[i].role)) break;
         const iterMeta = updated[i].metadata as ADKMetadata | undefined;
         const type = iterMeta?.originalType;
-        if (type === "ToolApprovalRequest") break;
+        if (iterMeta?.hitlCard) break;
         // Stamp the nearest non-agent tool-call request; text gets stats on terminal status.
         if (type === "ToolCallRequestEvent") {
           if (iterMeta?.toolCallData?.some(tc => isAgentToolName(tc.name))) break;
@@ -1027,41 +914,25 @@ export const createMessageHandlers = (handlers: MessageHandlers) => {
 
       // Check for tool approval interrupt
       if (isInputRequiredState(statusUpdate.status?.state) && statusUpdate.status?.message) {
-        const confirmationParts = findConfirmationParts(statusUpdate.status.message as Message);
-
-        if (confirmationParts.length > 0) {
+        const hitlPayload = getHitlPayload(statusUpdate.status.message as Message);
+        if (hitlPayload?.type === "tool_approval_request" || hitlPayload?.type === "ask_user_request") {
           commitArtifactText();
-          const hitlOriginalCallIds = new Set<string>();
-          for (const confPart of confirmationParts) {
-            collectHitlOriginalCallIds(confPart, hitlOriginalCallIds);
-          }
-          // Drop the ordinary function_call that the approval card replaces.
-          if (hitlOriginalCallIds.size > 0) {
+          const callIds = relatedHitlCallIds(hitlPayload);
+          if (callIds.size > 0) {
             handlers.setMessages(prev => prev.filter(message => {
-              const meta = message.metadata as ADKMetadata | undefined;
-              if (meta?.originalType !== "ToolCallRequestEvent") return true;
-              return !meta.toolCallData?.some(tc => hitlOriginalCallIds.has(tc.id));
+              const metadata = message.metadata as ADKMetadata | undefined;
+              return metadata?.originalType !== "ToolCallRequestEvent" ||
+                !metadata.toolCallData?.some(tool => callIds.has(tool.id));
             }));
           }
-          for (const confPart of confirmationParts) {
-            // Use pts.current (accumulated turn stats) in preference to turnStats
-            // (current event's stats) — the confirmation event often carries no
-            // usage_metadata of its own; the stats live in the preceding event.
-            appendMessage(buildApprovalMessage(confPart, statusUpdate.contextId, statusUpdate.taskId, {
-              tokenStats: pts.current ?? turnStats,
-            }));
+          for (const message of buildHitlMessagesFromPayload(hitlPayload, statusUpdate.contextId, statusUpdate.taskId, {
+            tokenStats: pts.current ?? turnStats,
+          })) {
+            appendMessage(message);
           }
-
-          // Accumulate this turn's stats now — the HITL interrupt ends the
-          // current invocation and the stream will pause until the user decides.
-          if (pts.current) {
-            accumulateSessionStats(pts.current);
-          }
+          if (pts.current) accumulateSessionStats(pts.current);
           pts.current = undefined;
-
-          if (handlers.setChatStatus) {
-            handlers.setChatStatus("input_required");
-          }
+          handlers.setChatStatus?.("input_required");
           return;
         }
       }
@@ -1170,7 +1041,7 @@ export const createMessageHandlers = (handlers: MessageHandlers) => {
         const partType = getMetadataValue<string>(partMetadata as Record<string, unknown>, "type");
         if (partType === "function_call") {
           const toolData = data as unknown as ToolCallData;
-          if (toolData.name === "adk_request_confirmation" || toolData.name === "adk_request_credential") {
+          if (toolData.name === "adk_request_credential") {
             continue;
           }
           flushBufferedText();

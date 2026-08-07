@@ -28,6 +28,9 @@ export async function POST(
         'Connection': 'keep-alive',
         'User-Agent': 'kagent-ui',
         [A2A_VERSION_HEADER]: A2A_PROTOCOL_VERSION,
+        ...(request.headers.has('A2A-Extensions') && {
+          'A2A-Extensions': request.headers.get('A2A-Extensions')!,
+        }),
       },
       body: JSON.stringify(a2aRequest),
     });
@@ -55,6 +58,8 @@ export async function POST(
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': CORS_ALLOW_HEADERS,
     });
+    const activatedExtensions = backendResponse.headers.get('A2A-Extensions');
+    if (activatedExtensions) responseHeaders.set('A2A-Extensions', activatedExtensions);
 
     const KEEP_ALIVE_INTERVAL_MS = 30000; // 30 seconds
     const stream = new ReadableStream({

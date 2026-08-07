@@ -7,6 +7,7 @@ import (
 	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	"github.com/kagent-dev/kagent/go/adk/pkg/a2a"
 )
 
 // newReq returns an empty outbound client Request with initialized service params.
@@ -204,4 +205,52 @@ func TestProcessResult_SetsSubagentSessionIDOnEveryBranch(t *testing.T) {
 			t.Errorf("SubagentSessionID = %q, want %q", resp.SubagentSessionID, contextID)
 		}
 	})
+}
+
+func TestHandleInputRequiredStoresPublicRemoteHitlState(t *testing.T) {
+	s := &remoteA2AState{name: "worker"}
+	task := &a2atype.Task{
+		ID:        "child-task",
+		ContextID: "child-context",
+		Status: a2atype.TaskStatus{
+			State: a2atype.TaskStateInputRequired,
+			Message: a2a.AttachHitlExtension(
+				a2atype.NewMessage(a2atype.MessageRoleAgent, a2atype.NewTextPart("Approval required")),
+				&a2a.ToolApprovalRequest{
+					Type: a2a.HITLTypeToolApprovalRequest,
+					Tools: []a2a.HitlTool{{
+						ID: "child-confirm", CallID: "child-call", Name: "delete_pod", Args: map[string]any{},
+					}},
+				},
+			),
+		},
+	}
+
+	// RequestConfirmation is not available without a real agent context; verify
+	// the state we would store matches the public extension shape.
+	state := a2a.BuildRemoteHitlState(task, s.name)
+	if state == nil || state.ToolApprovalRequest == nil {
+		t.Fatalf("state = %#v", state)
+	}
+	if _, legacy := state.ToMap()["hitl_parts"]; legacy {
+		t.Fatalf("remote state still uses legacy hitl_parts: %#v", state.ToMap())
+	}
+}
+
+func TestHandleInputRequiredWithoutHITLExtensionFails(t *testing.T) {
+	s := &remoteA2AState{name: "worker"}
+	task := &a2atype.Task{
+		Status: a2atype.TaskStatus{
+			State:   a2atype.TaskStateInputRequired,
+			Message: a2atype.NewMessage(a2atype.MessageRoleAgent, a2atype.NewTextPart("Input required")),
+		},
+	}
+
+	response := s.handleInputRequired(nil, task, "child-context")
+	if response.Status != "failed" || response.Error != "Remote agent 'worker' requested input without a valid HITL extension." {
+		t.Fatalf("response = %#v", response)
+	}
+	if response.SubagentSessionID != "child-context" {
+		t.Fatalf("SubagentSessionID = %q, want %q", response.SubagentSessionID, "child-context")
+	}
 }

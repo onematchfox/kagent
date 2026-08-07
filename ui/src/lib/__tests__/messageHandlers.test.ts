@@ -16,7 +16,7 @@ import {
   createMessageHandlers,
 } from '@/lib/messageHandlers';
 import { createDataPart, createMockMessage, createTextPart } from '@/mocks/factories';
-import type { TokenStats } from '@/types';
+import { HITL_EXTENSION_URI, type TokenStats } from '@/types';
 
 type MessageUpdate = Message[] | ((messages: Message[]) => Message[]);
 type StringUpdate = string | ((value: string) => string);
@@ -227,24 +227,24 @@ describe('messageHandlers helpers', () => {
   });
 
   test('reloaded input-required task renders user input, artifacts, then the current approval', () => {
-    const confirmation = createDataPart(
-      {
-        id: 'confirm-1',
-        name: 'adk_request_confirmation',
-        args: {
-          originalFunctionCall: { id: 'call-logs', name: 'k8s_get_pod_logs', args: { pod: 'x' } },
-          toolConfirmation: { confirmed: false },
-        },
-      },
-      { adk_type: 'function_call', adk_is_long_running: true },
-    );
     const task = sdkTask([
       sdkMessage({ messageId: 'u1', role: Role.ROLE_USER, parts: [createTextPart('logs')] }),
     ], {
       status: {
         state: TaskState.TASK_STATE_INPUT_REQUIRED,
         timestamp: new Date().toISOString(),
-        message: sdkMessage({ messageId: 'c1', role: Role.ROLE_AGENT, parts: [confirmation] }),
+        message: sdkMessage({
+          messageId: 'c1',
+          role: Role.ROLE_AGENT,
+          parts: [createTextPart('Approval required')],
+          extensions: [HITL_EXTENSION_URI],
+          metadata: {
+            [HITL_EXTENSION_URI]: {
+              type: 'tool_approval_request',
+              tools: [{ id: 'confirm-1', call_id: 'call-logs', name: 'k8s_get_pod_logs', args: { pod: 'x' } }],
+            },
+          },
+        }),
       },
       artifacts: [
         sdkArtifact('mixed', [
@@ -260,38 +260,77 @@ describe('messageHandlers helpers', () => {
     const { messages: approvalMessages, hasPendingApproval } = extractApprovalMessagesFromTasks([task]);
     const messages = [...artifactMessages, ...approvalMessages];
 
-    const types = messages.map(m => (m.metadata as ADKMetadata)?.originalType ?? m.role);
-    expect(types).toEqual([
+    const kinds = messages.map(m => {
+      const meta = m.metadata as ADKMetadata;
+      return meta?.hitlCard?.kind ?? meta?.originalType ?? m.role;
+    });
+    expect(kinds).toEqual([
       Role.ROLE_USER,
       'TextMessage',
       'ToolCallRequestEvent',
       'TextMessage',
-      'ToolApprovalRequest',
+      'tool_approval',
     ]);
     expect(messages[1].parts[0]?.content?.value).toBe('Fetching logs now.');
     expect(hasPendingApproval).toBe(true);
     expect(collectTaskTokenStats([task]).get('task')).toEqual({ total: 24, prompt: 20, completion: 4 });
   });
 
-  test('reloaded completed task anchors resolved HITL before its artifact response', () => {
-    const confirmation = createDataPart(
-      {
-        id: 'confirm-1',
-        name: 'adk_request_confirmation',
-        args: {
-          originalFunctionCall: { id: 'call-delete', name: 'delete_pod', args: { pod: 'x' } },
-          toolConfirmation: { confirmed: false },
-        },
+  test('reloaded input-required task renders approval for a no-argument tool', () => {
+    const task = sdkTask([], {
+      status: {
+        state: TaskState.TASK_STATE_INPUT_REQUIRED,
+        timestamp: new Date().toISOString(),
+        message: sdkMessage({
+          messageId: 'approval-message',
+          extensions: [HITL_EXTENSION_URI],
+          metadata: {
+            [HITL_EXTENSION_URI]: {
+              type: 'tool_approval_request',
+              tools: [{ id: 'approval-1', call_id: 'call-1', name: 'k8s_get_cluster_configuration', args: null }],
+            },
+          },
+        }),
       },
-      { adk_type: 'function_call', adk_is_long_running: true },
-    );
+    });
+
+    const { messages, hasPendingApproval } = extractApprovalMessagesFromTasks([task]);
+
+    expect(hasPendingApproval).toBe(true);
+    expect(messages).toHaveLength(1);
+    const card = (messages[0].metadata as ADKMetadata).hitlCard;
+    expect(card?.kind).toBe('tool_approval');
+    if (card?.kind === 'tool_approval') {
+      expect(card.calls[0].args).toEqual({});
+    }
+  });
+
+  test('reloaded completed task anchors resolved HITL before its artifact response', () => {
     const task = sdkTask([
       sdkMessage({ messageId: 'u1', role: Role.ROLE_USER, parts: [createTextPart('delete pod x')] }),
-      sdkMessage({ messageId: 'c1', role: Role.ROLE_AGENT, parts: [confirmation] }),
+      sdkMessage({
+        messageId: 'c1',
+        role: Role.ROLE_AGENT,
+        parts: [createTextPart('Approval required')],
+        extensions: [HITL_EXTENSION_URI],
+        metadata: {
+          [HITL_EXTENSION_URI]: {
+            type: 'tool_approval_request',
+            tools: [{ id: 'confirm-1', call_id: 'call-delete', name: 'delete_pod', args: { pod: 'x' } }],
+          },
+        },
+      }),
       sdkMessage({
         messageId: 'd1',
         role: Role.ROLE_USER,
-        parts: [createDataPart({ decision_type: 'approve' })],
+        parts: [createTextPart('Approved')],
+        extensions: [HITL_EXTENSION_URI],
+        metadata: {
+          [HITL_EXTENSION_URI]: {
+            type: 'tool_approval_response',
+            approvals: [{ id: 'confirm-1', approved: true }],
+          },
+        },
       }),
     ], {
       status: { state: TaskState.TASK_STATE_COMPLETED, timestamp: new Date().toISOString(), message: undefined },
@@ -308,14 +347,24 @@ describe('messageHandlers helpers', () => {
     });
 
     const messages = extractMessagesFromTasks([task]);
-    expect(messages.map(message => (message.metadata as ADKMetadata)?.originalType ?? message.role)).toEqual([
+    expect(messages.map(message => {
+      const meta = message.metadata as ADKMetadata;
+      return meta?.hitlCard?.kind ?? meta?.originalType ?? message.role;
+    })).toEqual([
       Role.ROLE_USER,
       'TextMessage',
-      'ToolApprovalRequest',
+      'tool_approval',
       'ToolCallExecutionEvent',
       'TextMessage',
     ]);
-    expect((messages[2].metadata as ADKMetadata).approvalDecision).toBe('approve');
+    const card = (messages[2].metadata as ADKMetadata).hitlCard;
+    expect(card?.kind).toBe('tool_approval');
+    if (card?.kind === 'tool_approval') {
+      expect(card.response).toEqual({
+        type: 'tool_approval_response',
+        approvals: [{ id: 'confirm-1', approved: true }],
+      });
+    }
   });
 
   test('extractTokenStatsFromTasks uses last usage per task and falls back total', () => {
@@ -417,8 +466,6 @@ describe('createMessageHandlers test', () => {
     expect((emitted[1].metadata as ADKMetadata).originalType).toBe('ToolCallExecutionEvent');
   });
 
-
-
   test('non-final artifact-update converts tool parts immediately', () => {
     const emitted: Message[] = [];
     const handlers = createMessageHandlers({
@@ -472,6 +519,7 @@ describe('createMessageHandlers test', () => {
     expect((emitted[0].metadata as ADKMetadata).originalType).toBe('TextMessage');
     expect(emitted[0].parts[0]?.content?.value).toBe('Cilium is on v1.19.5.');
   });
+
 
   test('artifact-update keeps unlabeled data parts that are not model-internal', () => {
     const emitted: Message[] = [];
@@ -619,25 +667,34 @@ describe('createMessageHandlers test', () => {
       agentContext: { namespace: 'kagent', agentName: 'testagent' },
     });
 
+    handlers.handleMessageEvent(artifactUpdateEvent({
+      lastChunk: true,
+      parts: [createDataPart(
+        { id: 'call_1', name: 'my_tool', args: { x: 1 } },
+        { kagent_type: 'function_call' },
+      )],
+    }));
+
     handlers.handleMessageEvent(statusUpdateEvent({
       state: TaskState.TASK_STATE_INPUT_REQUIRED,
       metadata: { kagent_usage_metadata: { totalTokenCount: 8, promptTokenCount: 5, candidatesTokenCount: 3 } },
       message: sdkMessage({
         messageId: 'hitl-msg',
-        parts: [createDataPart(
-          {
-            name: 'adk_request_confirmation',
-            id: 'confirm_1',
-            args: { originalFunctionCall: { name: 'my_tool', args: { x: 1 }, id: 'call_1' } },
+        parts: [createTextPart('Approval required')],
+        extensions: [HITL_EXTENSION_URI],
+        metadata: {
+          [HITL_EXTENSION_URI]: {
+            type: 'tool_approval_request',
+            tools: [{ id: 'confirm_1', call_id: 'call_1', name: 'my_tool', args: { x: 1 } }],
           },
-          { kagent_type: 'function_call', kagent_is_long_running: true },
-        )],
+        },
       }),
     }));
 
     expect(capturedSessionTotal).toEqual({ total: 8, prompt: 5, completion: 3 });
-    const approvalMsg = emitted.find((message) => (message.metadata as ADKMetadata)?.originalType === 'ToolApprovalRequest');
+    const approvalMsg = emitted.find((message) => (message.metadata as ADKMetadata)?.hitlCard?.kind === 'tool_approval');
     expect(approvalMsg).toBeDefined();
+    expect(emitted.some((message) => (message.metadata as ADKMetadata)?.originalType === 'ToolCallRequestEvent')).toBe(false);
   });
 });
 
@@ -657,6 +714,162 @@ describe('subagent_session_id propagation', () => {
     });
     return { emitted, handlers };
   }
+
+  test('nested HITL extension emits an AgentCall card linked to the paused child session', () => {
+    const { emitted, handlers } = makeHandlers();
+
+    handlers.handleMessageEvent(statusUpdateEvent({
+      state: TaskState.TASK_STATE_INPUT_REQUIRED,
+      message: sdkMessage({
+        messageId: 'nested-hitl',
+        extensions: [HITL_EXTENSION_URI],
+        metadata: {
+          [HITL_EXTENSION_URI]: {
+            type: 'tool_approval_request',
+            tools: [{ id: 'parent-confirm', call_id: 'parent-call', name: 'kagent__NS__child_agent', args: { request: 'delete pod' } }],
+            nested: {
+              subagent_name: 'kagent__NS__child_agent',
+              task_id: 'child-task',
+              context_id: 'child-session',
+              tools: [{ id: 'child-confirm', call_id: 'child-call', name: 'delete_pod', args: { name: 'old' } }],
+            },
+          },
+        },
+      }),
+    }));
+
+    expect(emitted.map(message => {
+      const meta = message.metadata as ADKMetadata;
+      return meta?.hitlCard?.kind ?? meta?.originalType;
+    })).toEqual([
+      'ToolCallRequestEvent',
+      'tool_approval',
+    ]);
+    expect((emitted[0].metadata as ADKMetadata).toolCallData).toEqual([{
+      id: 'parent-call',
+      name: 'kagent__NS__child_agent',
+      args: { request: 'delete pod' },
+      subagent_session_id: 'child-session',
+    }]);
+    const card = (emitted[1].metadata as ADKMetadata).hitlCard;
+    expect(card?.kind).toBe('tool_approval');
+    if (card?.kind === 'tool_approval') {
+      expect(card.calls[0]?.id).toBe('child-call');
+    }
+  });
+
+  test('nested ask_user does not emit a synthetic AgentCall card (parent call stays in transcript)', () => {
+    const { emitted, handlers } = makeHandlers();
+
+    handlers.handleMessageEvent(statusUpdateEvent({
+      state: TaskState.TASK_STATE_INPUT_REQUIRED,
+      message: sdkMessage({
+        messageId: 'nested-ask',
+        extensions: [HITL_EXTENSION_URI],
+        metadata: {
+          [HITL_EXTENSION_URI]: {
+            type: 'ask_user_request',
+            id: 'adk-synthetic-would-have-been-this',
+            questions: [{ question: 'Which resource?' }],
+            nested: {
+              subagent_name: 'kagent__NS__test_hitl_python',
+              task_id: 'child-task',
+              context_id: 'child-session',
+              tools: [{ id: 'ask-1', call_id: 'ask-1', name: 'ask_user', args: { questions: [{ question: 'Which resource?' }] } }],
+            },
+          },
+        },
+      }),
+    }));
+
+    expect(emitted.map(message => {
+      const meta = message.metadata as ADKMetadata;
+      return meta?.hitlCard?.kind ?? meta?.originalType;
+    })).toEqual(['ask_user']);
+    expect(emitted.some(message =>
+      (message.metadata as ADKMetadata)?.originalType === 'ToolCallRequestEvent',
+    )).toBe(false);
+  });
+
+  test('reloaded nested ask_user appends only the ask card beside the artifact parent call', () => {
+    const task = sdkTask([
+      sdkMessage({
+        messageId: 'u1',
+        role: Role.ROLE_USER,
+        parts: [createTextPart('ask the hitl agent')],
+      }),
+    ], {
+      status: {
+        state: TaskState.TASK_STATE_INPUT_REQUIRED,
+        timestamp: new Date().toISOString(),
+        message: sdkMessage({
+          messageId: 'status-ask',
+          extensions: [HITL_EXTENSION_URI],
+          metadata: {
+            [HITL_EXTENSION_URI]: {
+              type: 'ask_user_request',
+              id: 'adk-hitl-id',
+              questions: [{ question: 'Which resource?' }],
+              nested: {
+                subagent_name: 'kagent__NS__test_hitl_python',
+                task_id: 'child-task',
+                context_id: '019fd37c-e622-7d23-a4b6-b7598a2f39b8',
+                tools: [{
+                  id: 'ask-1',
+                  call_id: 'ask-1',
+                  name: 'ask_user',
+                  args: { questions: [{ question: 'Which resource?' }] },
+                }],
+              },
+            },
+          },
+        }),
+      },
+      artifacts: [
+        sdkArtifact('call', [createDataPart(
+          {
+            id: 'call_parent',
+            name: 'kagent__NS__test_hitl_python',
+            args: { request: 'Ask the user what resources they want to list' },
+          },
+          { adk_type: 'function_call' },
+        )]),
+        sdkArtifact('resp', [createDataPart(
+          {
+            id: 'call_parent',
+            name: 'kagent__NS__test_hitl_python',
+            response: {
+              status: 'pending',
+              subagent: 'kagent__NS__test_hitl_python',
+              subagent_session_id: '019fd37c-e622-7d23-a4b6-b7598a2f39b8',
+              waiting_for: 'subagent_approval',
+            },
+          },
+          { adk_type: 'function_response' },
+        )]),
+      ],
+    });
+
+    const artifactMessages = extractMessagesFromTasks([task]);
+    const { messages: approvalMessages, hasPendingApproval } = extractApprovalMessagesFromTasks([task]);
+    const messages = [...artifactMessages, ...approvalMessages];
+
+    expect(hasPendingApproval).toBe(true);
+    const kinds = messages.map(m => {
+      const meta = m.metadata as ADKMetadata;
+      return meta?.hitlCard?.kind ?? meta?.originalType ?? m.role;
+    });
+    expect(kinds).toEqual([
+      Role.ROLE_USER,
+      'ToolCallRequestEvent',
+      'ToolCallExecutionEvent',
+      'ask_user',
+    ]);
+    // One parent agent call — no synthetic Delegating duplicate.
+    expect(messages.filter(m =>
+      (m.metadata as ADKMetadata)?.originalType === 'ToolCallRequestEvent',
+    )).toHaveLength(1);
+  });
 
   test('artifact-update: agent function_response with subagent_session_id in response dict emits toolResultData with subagent_session_id', () => {
     const { emitted, handlers } = makeHandlers();

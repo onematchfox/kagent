@@ -11,6 +11,7 @@ import (
 	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	"github.com/a2aproject/a2a-go/v2/a2aclient/agentcard"
+	"github.com/a2aproject/a2a-go/v2/a2aext"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/kagent-dev/kagent/go/adk/pkg/a2a"
 	"github.com/kagent-dev/kagent/go/adk/pkg/constants"
@@ -276,6 +277,7 @@ func (s *remoteA2AState) ensureClient(ctx context.Context) (*a2aclient.Client, e
 			a2aclient.WithJSONRPCTransport(s.httpClient),
 		}
 		interceptors := []a2aclient.CallInterceptor{
+			a2aext.NewActivator(a2a.HITLExtensionURI),
 			&staticHeadersInterceptor{headers: map[string]string{"x-kagent-source": "agent"}},
 			&userIDForwardingInterceptor{},
 			&lineageHeadersInterceptor{},
@@ -339,33 +341,35 @@ func (s *remoteA2AState) handleFirstCall(ctx adkagent.Context, requestText strin
 func (s *remoteA2AState) handleResume(ctx adkagent.Context) (remoteA2AResponse, error) {
 	confirmation := ctx.ToolConfirmation()
 	payload, _ := confirmation.Payload.(map[string]any)
-	hitlPayload := a2a.ParseHitlConfirmationPayload(payload)
+	remoteState := a2a.ParseRemoteHitlState(payload)
+	if remoteState == nil {
+		slog.Error("Resume for remote agent without valid remote HITL state", "tool", s.name)
+		return remoteA2AResponse{Error: fmt.Sprintf("Cannot resume remote agent '%s': missing task context.", s.name)}, nil
+	}
+	if !remoteState.HasResponse() {
+		slog.Error("Resume for remote agent without a HITL response",
+			"tool", remoteState.SubagentName, "taskID", remoteState.TaskID)
+		return remoteA2AResponse{Error: fmt.Sprintf("Cannot resume remote agent '%s': missing HITL response.", remoteState.SubagentName)}, nil
+	}
 
-	taskID := hitlPayload.TaskID
-	contextID := hitlPayload.ContextID
-	subagentName := hitlPayload.SubagentName
+	subagentName := remoteState.SubagentName
 	if subagentName == "" {
 		subagentName = s.name
 	}
-
-	if taskID == "" {
-		slog.Error("Resume for remote agent but no task_id in confirmation payload", "tool", s.name)
-		return remoteA2AResponse{Error: fmt.Sprintf("Cannot resume remote agent '%s': missing task context.", subagentName)}, nil
-	}
-
-	decisionData := buildDecisionData(confirmation.Confirmed, hitlPayload)
+	taskID := remoteState.TaskID
+	contextID := remoteState.ContextID
 
 	message := &a2atype.Message{
 		ID:        a2atype.NewMessageID(),
 		TaskID:    a2atype.TaskID(taskID),
 		ContextID: contextID,
 		Role:      a2atype.MessageRoleUser,
-		Parts:     a2atype.ContentParts{a2atype.NewDataPart(decisionData)},
+		Parts:     a2atype.ContentParts{a2atype.NewTextPart("Human input supplied")},
 	}
+	a2a.AttachHitlExtension(message, remoteState.ResponsePayload())
 
-	decisionType, _ := decisionData[a2a.KAgentHitlDecisionTypeKey].(string)
-	slog.Info("Forwarding decision to subagent",
-		"decisionType", decisionType,
+	slog.Info("Forwarding HITL response to subagent",
+		"responseType", remoteState.ResponseType(),
 		"subagent", subagentName,
 		"taskID", taskID,
 	)
@@ -454,37 +458,21 @@ func (s *remoteA2AState) handleInputRequired(ctx adkagent.Context, task *a2atype
 		}
 	}
 
-	var hitlParts []a2a.HitlPartInfo
-	if task.Status.Message != nil {
-		hitlParts = a2a.ExtractHitlInfoFromParts(task.Status.Message.Parts)
-	}
-
-	var innerToolNames []string
-	for _, hp := range hitlParts {
-		if hp.OriginalFunctionCall.Name != "" {
-			innerToolNames = append(innerToolNames, hp.OriginalFunctionCall.Name)
+	state := a2a.BuildRemoteHitlState(task, s.name)
+	if state == nil {
+		slog.Error("Subagent returned input_required without a valid HITL extension", "tool", s.name)
+		return remoteA2AResponse{
+			Error:             fmt.Sprintf("Remote agent '%s' requested input without a valid HITL extension.", s.name),
+			Status:            "failed",
+			SubagentSessionID: contextID,
 		}
 	}
 
-	var hint string
-	if len(innerToolNames) > 0 {
-		hint = fmt.Sprintf("Remote agent '%s' requires approval for tool(s): %s",
-			s.name, strings.Join(innerToolNames, ", "))
-	} else {
-		hint = fmt.Sprintf("Remote agent '%s' requires human input before continuing.", s.name)
-	}
-
-	confirmPayload := a2a.HitlConfirmationPayload{
-		TaskID:       string(task.ID),
-		ContextID:    task.ContextID,
-		SubagentName: s.name,
-		HitlParts:    hitlParts,
-	}
-
+	hint := a2a.RemoteHitlHint(state)
 	slog.Info("Subagent returned input_required, requesting confirmation from parent",
 		"tool", s.name, "taskID", task.ID)
 
-	if err := ctx.RequestConfirmation(hint, confirmPayload.ToMap()); err != nil {
+	if err := ctx.RequestConfirmation(hint, state.ToMap()); err != nil {
 		slog.Error("Failed to request confirmation", "tool", s.name, "error", err)
 	}
 	return remoteA2AResponse{
@@ -492,50 +480,6 @@ func (s *remoteA2AState) handleInputRequired(ctx adkagent.Context, task *a2atype
 		WaitingFor:        "subagent_approval",
 		Subagent:          s.name,
 		SubagentSessionID: contextID,
-	}
-}
-
-// buildDecisionData constructs the decision DataPart.Data map to forward to the subagent.
-func buildDecisionData(confirmed bool, payload a2a.HitlConfirmationPayload) map[string]any {
-	switch {
-	case len(payload.BatchDecisions) > 0:
-		batchDecisions := make(map[string]any, len(payload.BatchDecisions))
-		for id, decision := range payload.BatchDecisions {
-			batchDecisions[id] = string(decision)
-		}
-		data := map[string]any{
-			a2a.KAgentHitlDecisionTypeKey: a2a.KAgentHitlDecisionTypeBatch,
-			a2a.KAgentHitlDecisionsKey:    batchDecisions,
-		}
-		if len(payload.RejectionReasons) > 0 {
-			rejReasons := make(map[string]any, len(payload.RejectionReasons))
-			for id, reason := range payload.RejectionReasons {
-				rejReasons[id] = reason
-			}
-			data[a2a.KAgentHitlRejectionReasonsKey] = rejReasons
-		}
-		return data
-
-	case len(payload.Answers) > 0:
-		askUserAnswers := make([]map[string]any, 0, len(payload.Answers))
-		for _, answer := range payload.Answers {
-			askUserAnswers = append(askUserAnswers, map[string]any{"answer": answer.Answer})
-		}
-		return map[string]any{
-			a2a.KAgentHitlDecisionTypeKey: a2a.KAgentHitlDecisionTypeApprove,
-			a2a.KAgentAskUserAnswersKey:   askUserAnswers,
-		}
-
-	default:
-		decisionType := a2a.KAgentHitlDecisionTypeApprove
-		if !confirmed {
-			decisionType = a2a.KAgentHitlDecisionTypeReject
-		}
-		data := map[string]any{a2a.KAgentHitlDecisionTypeKey: decisionType}
-		if !confirmed && payload.RejectionReason != "" {
-			data["rejection_reason"] = payload.RejectionReason
-		}
-		return data
 	}
 }
 
