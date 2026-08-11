@@ -17,7 +17,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/kagent-dev/kagent/go/api/client"
 	api "github.com/kagent-dev/kagent/go/api/httpapi"
-	"github.com/kagent-dev/kagent/go/api/v1alpha2"
+	"github.com/kagent-dev/kagent/go/api/v1alpha3"
 	clia2a "github.com/kagent-dev/kagent/go/core/cli/internal/a2a"
 	"github.com/kagent-dev/kagent/go/core/cli/internal/config"
 	"github.com/kagent-dev/kagent/go/core/cli/internal/tui/dialogs"
@@ -461,11 +461,7 @@ func (m *workspaceModel) startChat(loadHistory bool) tea.Cmd {
 	if m.agent == nil || m.current == nil {
 		return nil
 	}
-	a2aPath := "api/a2a"
-	if m.agent != nil && m.agent.WorkloadMode == v1alpha2.WorkloadModeSandbox {
-		a2aPath = "api/a2a-sandboxes"
-	}
-	a2aURL := fmt.Sprintf("%s/%s/%s", m.cfg.KAgentURL, a2aPath, m.agentRef)
+	a2aURL := fmt.Sprintf("%s/api/a2a-sandboxes/%s", m.cfg.KAgentURL, m.agentRef)
 	client, err := clia2a.NewClient(context.Background(), a2aURL, clia2a.ClientOptions{Timeout: m.cfg.Timeout})
 	if err != nil {
 		m.details.WriteString("\nA2A error\n")
@@ -527,7 +523,7 @@ func (m *workspaceModel) renderDetails() {
 		fmt.Fprintf(&m.details, "\nTools:\n")
 		for _, t := range m.agent.Agent.Spec.Declarative.Tools {
 			switch t.Type {
-			case v1alpha2.ToolProviderType_McpServer:
+			case v1alpha3.ToolProviderType_McpServer:
 				name := ""
 				if t.McpServer != nil {
 					name = t.McpServer.Name
@@ -537,7 +533,7 @@ func (m *workspaceModel) renderDetails() {
 					fmt.Fprintf(&m.details, " (tools: %s)", strings.Join(t.McpServer.ToolNames, ", "))
 				}
 				fmt.Fprint(&m.details, "\n")
-			case v1alpha2.ToolProviderType_Agent:
+			case v1alpha3.ToolProviderType_Agent:
 				name := ""
 				if t.Agent != nil {
 					name = t.Agent.Name
