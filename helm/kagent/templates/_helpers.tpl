@@ -291,3 +291,29 @@ imagePullSecrets:
 {{- end -}}
 {{- end -}}
 
+{{/*
+Validate oauth2-proxy config against options removed/replaced by the move to
+alphaConfig, so misconfiguration fails fast at template/install/upgrade time
+with a clear message -- instead of surfacing later as either a
+CrashLoopBackOff (oauth2-proxy refuses to start with these as flags/env vars
+once alphaConfig.enabled is true) or a silently-ignored setting (these extraEnv
+entries no longer feed any flag, so they'd just sit on the pod unused).
+*/}}
+{{- define "kagent.oauth2Proxy.validate" -}}
+{{- $o2p := index .Values "oauth2-proxy" -}}
+{{- if $o2p.alphaConfig.enabled -}}
+{{- $removedArgs := list "provider" "oidc-issuer-url" "upstream" "scope" "approval-prompt" "pass-authorization-header" "set-authorization-header" -}}
+{{- range $removedArgs -}}
+{{- if hasKey $o2p.extraArgs . -}}
+{{- fail (printf "oauth2-proxy.extraArgs.%s is no longer valid once oauth2-proxy.alphaConfig.enabled is true -- oauth2-proxy refuses to start with it set as a flag (see https://oauth2-proxy.github.io/oauth2-proxy/configuration/alpha-config/#removed-options). It's already covered by oauth2-proxy.alphaConfig.configFile; remove it from extraArgs." .) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $replacement := dict "OIDC_ISSUER_URL" "config.oidcIssuerURL" "OIDC_REDIRECT_URL" "config.oidcRedirectURL" "UPSTREAM_URL" "config.upstreamURL" -}}
+{{- range $o2p.extraEnv -}}
+{{- if hasKey $replacement .name -}}
+{{- fail (printf "oauth2-proxy.extraEnv entry %q is no longer used. Set oauth2-proxy.%s directly instead." .name (index $replacement .name)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
