@@ -966,6 +966,14 @@ oauth2-proxy:
   #     value: /etc/ssl/certs/custom-ca.crt
 
   config:
+    oidcIssuerURL: ""
+    oidcRedirectURL: ""
+    oidcScope: "openid profile email groups"
+    # IMPORTANT: This must match the UI service name, which is templated as
+    # "<release-name>-ui" (or "<fullnameOverride>-ui"). Override this value
+    # if your release name is not "kagent" or you set fullnameOverride.
+    upstreamURL: "http://kagent-ui:8080"
+
     # Option 1: Reference existing secret (recommended for production)
     # Secret must contain: client-id, client-secret, cookie-secret
     existingSecret: ""
@@ -975,31 +983,93 @@ oauth2-proxy:
     clientSecret: ""
     cookieSecret: ""
 
-  # Cluster-specific OIDC settings - override these per deployment
-  # These are set as env vars and referenced in args for easy patching
-  extraEnv:
-    - name: OIDC_ISSUER_URL
-      value: ""
-    - name: OIDC_REDIRECT_URL
-      value: ""
-    # IMPORTANT: This must match the UI service name, which is templated as
-    # "<release-name>-ui" (or "<fullnameOverride>-ui"). Override this value
-    # if your release name is not "kagent" or you set fullnameOverride.
-    - name: UPSTREAM_URL
-      value: "http://kagent-ui:8080"
+  alphaConfig:
+    enabled: true
+    # alphaConfig.configFile (rather than configData) is used so that the
+    # cluster-specific OIDC/upstream settings below can still be resolved from
+    # Helm values (via `tpl`) instead of being literal values baked into this
+    # file -- configData is rendered with `toYaml`, which can't do that.
+    configFile: |
+      providers:
+        - id: oidc
+          provider: oidc
+          clientID: "${OAUTH2_PROXY_CLIENT_ID}"
+          clientSecret: "${OAUTH2_PROXY_CLIENT_SECRET}"
+          oidcConfig:
+            issuerURL: {{ .Values.config.oidcIssuerURL | quote }}
+            insecureSkipNonce: true
+            emailClaim: email
+            groupsClaim: groups
+            userIDClaim: email
+            audienceClaims:
+              - aud
+          scope: {{ .Values.config.oidcScope | quote }}
+          loginURLParameters:
+            - name: approval_prompt
+              default:
+                - auto
+      upstreamConfig:
+        upstreams:
+          {{- /* UPSTREAM_URL may be a single URL or a comma-separated list (each
+                 entry's own URL path becomes its route prefix). */}}
+          {{- $upstreamURLs := .Values.config.upstreamURL | splitList "," }}
+          {{- range $i, $upstreamURL := $upstreamURLs }}
+          - id: {{ printf "upstream-%d" $i | quote }}
+            path: {{ (urlParse $upstreamURL).path | default "/" | quote }}
+            uri: {{ $upstreamURL | quote }}
+            timeout: 300s
+          {{- end }}
+      injectRequestHeaders:
+        - name: X-Forwarded-Groups
+          preserveRequestValue: false
+          values:
+            - claimSource:
+                claim: groups
+        - name: X-Forwarded-User
+          preserveRequestValue: false
+          values:
+            - claimSource:
+                claim: user
+        - name: X-Forwarded-Email
+          preserveRequestValue: false
+          values:
+            - claimSource:
+                claim: email
+        - name: X-Forwarded-Preferred-Username
+          preserveRequestValue: false
+          values:
+            - claimSource:
+                claim: preferred_username
+        - name: Authorization
+          preserveRequestValue: false
+          values:
+            - claimSource:
+                claim: id_token
+                prefix: 'Bearer '
+        # Strip X-User-Id / X-Agent-Name headers to prevent users from
+        # impersonating an arbitrary user.
+        - name: X-User-Id
+          preserveRequestValue: false
+        - name: X-Agent-Name
+          preserveRequestValue: false
+      injectResponseHeaders:
+        - name: Authorization
+          preserveRequestValue: false
+          values:
+            - claimSource:
+                claim: id_token
+                prefix: 'Bearer '
 
-  # extraArgs as a map - each key becomes --key=value in container args
-  # Uses $(VAR_NAME) syntax to reference env vars set above
+  # extraArgs as a map - each key becomes --key=value in container args.
+  # Values are templated (tpl), so they can reference chart values directly.
+  # NOTE: provider/oidc-issuer-url/upstream/scope/approval-prompt/
+  # pass-authorization-header/set-authorization-header moved into
+  # alphaConfig.configFile above -- oauth2-proxy refuses to start with those
+  # set as flags/env vars once alphaConfig.enabled is true. See
+  # https://oauth2-proxy.github.io/oauth2-proxy/configuration/alpha-config/#removed-options
   extraArgs:
-    provider: oidc
-    oidc-issuer-url: "$(OIDC_ISSUER_URL)"
-    redirect-url: "$(OIDC_REDIRECT_URL)"
-    upstream: "$(UPSTREAM_URL)"
+    redirect-url: "{{ .Values.config.oidcRedirectURL }}"
     email-domain: "*"
-    pass-authorization-header: true
-    set-authorization-header: true
-    approval-prompt: "auto"
-    scope: "openid profile email groups"
     # Cookie security settings
     cookie-secure: true
     cookie-samesite: "lax"

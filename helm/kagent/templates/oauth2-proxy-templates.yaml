@@ -1,4 +1,5 @@
 {{- if index .Values "oauth2-proxy" "enabled" }}
+{{- include "kagent.oauth2Proxy.validate" . -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
