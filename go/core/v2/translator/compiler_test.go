@@ -3,8 +3,11 @@ package translator_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"slices"
 	"testing"
 
+	"github.com/kagent-dev/kagent/go/api/adk"
 	"github.com/kagent-dev/kagent/go/api/v1alpha3"
 	v2translator "github.com/kagent-dev/kagent/go/core/v2/translator"
 	"github.com/stretchr/testify/require"
@@ -21,6 +24,61 @@ func modelConfig() *v1alpha3.ModelConfig {
 	return &v1alpha3.ModelConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "default-model", Namespace: "test"},
 		Spec:       v1alpha3.ModelConfigSpec{Provider: v1alpha3.ModelProviderOpenAI, Model: "gpt-4o"},
+	}
+}
+
+func TestCompileAgentTemplatePinsAgentPluginSources(t *testing.T) {
+	harness := &v1alpha3.Harness{
+		ObjectMeta: metav1.ObjectMeta{Name: "kagent", Namespace: "test"},
+		Spec: v1alpha3.HarnessSpec{
+			Kagent:   &v1alpha3.KagentHarness{},
+			Workload: v1alpha3.HarnessWorkload{Image: "example.com/kagent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+			Substrate: v1alpha3.HarnessSubstratePolicy{
+				WorkerPoolRef: corev1.LocalObjectReference{Name: "default"}, SnapshotPolicy: v1alpha3.HarnessSnapshotPolicy{Location: "snapshots"},
+			},
+		},
+	}
+	template := &v1alpha3.AgentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "helper", Namespace: "test"},
+		Spec: v1alpha3.AgentTemplateSpec{
+			ModelConfig: v1alpha3.AgentTemplateLocalReference{Name: "default-model"},
+			Skills: []v1alpha3.AgentTemplateSkill{
+				{Name: "review", Source: v1alpha3.ArtifactSource{
+					OCI: "ghcr.io/acme/review@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+				}},
+				{Name: "summary", Source: v1alpha3.ArtifactSource{
+					OCI: "acme/summary@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+				}},
+			},
+			Plugins: []v1alpha3.PluginBundle{
+				{
+					Source: v1alpha3.ArtifactSource{Git: &v1alpha3.GitArtifact{
+						URL: "https://github.com/acme/plugin", Commit: "cccccccccccccccccccccccccccccccccccccccc",
+					}},
+					Skills: []string{"deploy"},
+				},
+				{Source: v1alpha3.ArtifactSource{Bucket: &v1alpha3.BucketArtifact{S3: v1alpha3.S3Object{
+					Endpoint: "https://objects.example.com", Bucket: "plugins", Key: "plugin.zip", VersionID: "version-1",
+				}}}},
+			},
+		},
+	}
+	spec, err := compiler(t, modelConfig()).CompileAgentTemplate(context.Background(), harness, template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config adk.AgentConfig
+	if err := json.Unmarshal(spec.ConfigJSON, &config); err != nil {
+		t.Fatal(err)
+	}
+	plugins := config.AgentPlugins
+	if plugins == nil || len(plugins.Skills) != 2 || len(plugins.Plugins) != 2 || plugins.Plugins[0].Source.Git.Commit != "cccccccccccccccccccccccccccccccccccccccc" {
+		t.Fatalf("compiled Agent Plugins config = %#v", config)
+	}
+	for _, host := range []string{"ghcr.io", "registry-1.docker.io", "github.com", "objects.example.com"} {
+		if !slices.Contains(spec.EgressDestinations, host) {
+			t.Fatalf("egress destinations %v do not contain %q", spec.EgressDestinations, host)
+		}
 	}
 }
 

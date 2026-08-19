@@ -53,12 +53,6 @@ func (c *Compiler) CompileAgentTemplate(ctx context.Context, harness *v1alpha3.H
 	if harness.Spec.Kagent == nil {
 		return nil, newValidationError("Harness runtime is not supported by the K3 kagent adapter")
 	}
-	if len(template.Spec.Skills) > 0 {
-		return nil, newValidationError("spec.skills is not supported yet")
-	}
-	if len(template.Spec.Plugins) > 0 {
-		return nil, newValidationError("spec.plugins is not supported yet")
-	}
 	for _, tool := range template.Spec.Tools {
 		if tool.Agent != nil {
 			return nil, newValidationError("AgentTemplate-backed tools are not supported yet")
@@ -141,6 +135,13 @@ func (c *Compiler) CompileAgentTemplate(ctx context.Context, harness *v1alpha3.H
 			return nil, err
 		}
 	}
+	pluginConfig, err := agentPluginConfig(template)
+	if err != nil {
+		return nil, err
+	}
+	if len(pluginConfig.Skills) > 0 || len(pluginConfig.Plugins) > 0 {
+		cfg.AgentPlugins = &pluginConfig
+	}
 
 	configJSON, err := json.Marshal(cfg)
 	if err != nil {
@@ -185,6 +186,13 @@ func (c *Compiler) CompileAgentTemplate(ctx context.Context, harness *v1alpha3.H
 		return nil, fmt.Errorf("resolve runtime environment: %w", err)
 	}
 
+	egressDestinations := agentConfigDestinations(cfg, modelConfig, modelRuntime.Model)
+	// Package sources are explicit API inputs. Destinations found inside a
+	// package remain blocked by the revision's network policy.
+	egressDestinations = append(egressDestinations, agentPluginSourceDestinations(pluginConfig)...)
+	slices.Sort(egressDestinations)
+	egressDestinations = slices.Compact(egressDestinations)
+
 	return &Revision{
 		Namespace:          template.Namespace,
 		AgentTemplateName:  template.Name,
@@ -196,8 +204,74 @@ func (c *Compiler) CompileAgentTemplate(ctx context.Context, harness *v1alpha3.H
 		WorkerPoolName:     harness.Spec.Substrate.WorkerPoolRef.Name,
 		SnapshotLocation:   harness.Spec.Substrate.SnapshotPolicy.Location,
 		Provenance:         provenance,
-		EgressDestinations: agentConfigDestinations(cfg, modelConfig, modelRuntime.Model),
+		EgressDestinations: egressDestinations,
 	}, nil
+}
+
+func agentPluginSourceDestinations(config adk.AgentPluginConfig) []string {
+	var result []string
+	appendSource := func(source adk.AgentPluginSource) {
+		switch {
+		case source.Git != nil:
+			result = appendURLHost(result, source.Git.URL)
+		case source.OCI != "":
+			repository := strings.SplitN(source.OCI, "@", 2)[0]
+			first, _, found := strings.Cut(repository, "/")
+			if found && (strings.Contains(first, ".") || strings.Contains(first, ":") || first == "localhost") {
+				result = append(result, first)
+			} else {
+				result = append(result, "registry-1.docker.io")
+			}
+		case source.S3 != nil:
+			result = appendURLHost(result, source.S3.Endpoint)
+		}
+	}
+	for _, skill := range config.Skills {
+		appendSource(skill.Source)
+	}
+	for _, plugin := range config.Plugins {
+		appendSource(plugin.Source)
+	}
+	return result
+}
+
+func agentPluginConfig(template *v1alpha3.AgentTemplate) (adk.AgentPluginConfig, error) {
+	result := adk.AgentPluginConfig{
+		Skills:  make([]adk.StandaloneSkill, 0, len(template.Spec.Skills)),
+		Plugins: make([]adk.AgentPluginBundle, 0, len(template.Spec.Plugins)),
+	}
+	names := make(map[string]struct{})
+	for _, skill := range template.Spec.Skills {
+		if _, exists := names[skill.Name]; exists {
+			return adk.AgentPluginConfig{}, newValidationError("duplicate skill name %q", skill.Name)
+		}
+		names[skill.Name] = struct{}{}
+		result.Skills = append(result.Skills, adk.StandaloneSkill{Name: skill.Name, Source: agentPluginSource(skill.Source)})
+	}
+	for _, plugin := range template.Spec.Plugins {
+		for _, name := range plugin.Skills {
+			if _, exists := names[name]; exists {
+				return adk.AgentPluginConfig{}, newValidationError("duplicate skill name %q", name)
+			}
+			names[name] = struct{}{}
+		}
+		result.Plugins = append(result.Plugins, adk.AgentPluginBundle{Source: agentPluginSource(plugin.Source), Skills: append([]string(nil), plugin.Skills...)})
+	}
+	return result, nil
+}
+
+func agentPluginSource(source v1alpha3.ArtifactSource) adk.AgentPluginSource {
+	result := adk.AgentPluginSource{OCI: source.OCI, Path: source.Path}
+	if source.Git != nil {
+		result.Git = &adk.AgentPluginGit{URL: source.Git.URL, Commit: source.Git.Commit}
+	}
+	if source.Bucket != nil {
+		result.S3 = &adk.AgentPluginS3{
+			Endpoint: source.Bucket.S3.Endpoint, Bucket: source.Bucket.S3.Bucket, Key: source.Bucket.S3.Key,
+			VersionID: source.Bucket.S3.VersionID, Region: source.Bucket.S3.Region,
+		}
+	}
+	return result
 }
 
 // resolveEnvironment replaces Kubernetes Secret references with literals
