@@ -948,6 +948,11 @@ oauth2-proxy:
       mountPath: /templates
       readOnly: true
 
+  extraEnv:
+    # Forces a rollout whenever the sign_in.html ConfigMap's content changes.
+    - name: KAGENT_OAUTH2_PROXY_SIGNIN_TEMPLATE_CHECKSUM
+      value: '{{ include "kagent.oauth2ProxySignInHTML" . | sha256sum }}'
+
   # Mount custom CA certificate for TLS verification (if needed)
   # Add to extraVolumes:
   #   - name: custom-ca-cert
