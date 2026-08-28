@@ -517,7 +517,15 @@ func (g *Gateway) prepareReply(ctx context.Context, instance *apiv1alpha1.AgentI
 	}
 	message.ContextID = stored.ContextID
 	attempt := *stored
-	attempt.History = append(append([]*a2atype.Message{}, stored.History...), message)
+	attempt.History = append([]*a2atype.Message{}, stored.History...)
+	if question := stored.Status.Message; question != nil {
+		if question.ID == "" {
+			return nil, a2atype.NewError(a2atype.ErrInternalError, "stored task status message has no ID")
+		}
+		question.TaskID, question.ContextID = stored.ID, stored.ContextID
+		attempt.History = append(attempt.History, question)
+	}
+	attempt.History = append(attempt.History, message)
 	now := time.Now()
 	attempt.Status = a2atype.TaskStatus{State: a2atype.TaskStateSubmitted, Timestamp: &now}
 	if err := g.store.StoreAgentInstanceTaskEvent(ctx, instance.GetId(), &attempt, message, nil); err != nil {
