@@ -15,6 +15,7 @@ import (
 	v2translator "github.com/kagent-dev/kagent/go/core/v2/translator"
 	byotranslator "github.com/kagent-dev/kagent/go/core/v2/translator/byo"
 	claudetranslator "github.com/kagent-dev/kagent/go/core/v2/translator/claude"
+	codextranslator "github.com/kagent-dev/kagent/go/core/v2/translator/codex"
 	kagenttranslator "github.com/kagent-dev/kagent/go/core/v2/translator/kagent"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -25,7 +26,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
-	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // PairReconciliation is the complete desired and observed state for one
@@ -34,6 +34,7 @@ import (
 type PairReconciliation struct {
 	Pair                  AgentTemplateHarnessPair
 	Revision              *v2translator.Revision
+	Warnings              []string
 	RevisionID            v2translator.RevisionID
 	DesiredActorTemplate  *ateapipb.ActorTemplate
 	ObservedActorTemplate *ateapipb.ActorTemplate
@@ -57,8 +58,9 @@ func newPairReconciliations(
 ) krt.Collection[PairReconciliation] {
 	return krt.NewCollection(pairs, func(ctx krt.HandlerContext, pair AgentTemplateHarnessPair) *PairReconciliation {
 		state := &PairReconciliation{Pair: pair}
-		revision, err := v2translator.NewCompiler(ctx, collections, map[v2translator.HarnessType]v2translator.HarnessCompiler{
+		compilation, err := v2translator.NewCompiler(ctx, collections, map[v2translator.HarnessType]v2translator.HarnessCompiler{
 			v2translator.HarnessTypeKagent: kagenttranslator.NewCompiler(ctx, collections),
+			v2translator.HarnessTypeCodex:  codextranslator.NewCompiler(ctx, collections),
 			v2translator.HarnessTypeClaude: claudetranslator.NewCompiler(ctx, collections),
 			v2translator.HarnessTypeBYO:    byotranslator.NewCompiler(ctx, collections),
 		}).CompileAgentTemplate(context.Background(), pair.Harness, pair.AgentTemplate)
@@ -71,7 +73,9 @@ func newPairReconciliations(
 			state.Failure = &ReconciliationFailure{Condition: condition, Reason: reason, Message: err.Error()}
 			return state
 		}
+		revision := &compilation.Revision
 		state.Revision = revision
+		state.Warnings = append([]string(nil), compilation.Warnings...)
 		state.RevisionID, err = revision.Digest()
 		if err != nil {
 			state.Failure = &ReconciliationFailure{Condition: kagentv1alpha3.AgentTemplateConditionCompatible, Reason: "RevisionInvalid", Message: err.Error()}
@@ -255,15 +259,6 @@ func (r *Reconciler) reconcilePair(ctx context.Context, key string) error {
 	if state.Revision == nil || state.RevisionID.IsZero() {
 		return r.cleanupUnreferencedRevisions(ctx)
 	}
-	for _, warning := range state.Revision.Warnings {
-		ctrllog.FromContext(ctx).Info("runtime configuration warning",
-			"namespace", state.Pair.AgentTemplate.Namespace,
-			"agentTemplate", state.Pair.AgentTemplate.Name,
-			"harness", state.Pair.Harness.Name,
-			"warning", warning,
-		)
-	}
-
 	pair := dbpkg.AgentTemplateHarnessPair{
 		Namespace: state.Pair.AgentTemplate.Namespace, AgentTemplateName: state.Pair.AgentTemplate.Name,
 		AgentTemplateUID: string(state.Pair.AgentTemplate.UID), HarnessName: state.Pair.Harness.Name,

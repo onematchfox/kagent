@@ -128,7 +128,7 @@ jobs:
             --set-string substrateWorkerPool.workerImage=ghcr.io/kagent-dev/substrate/ateom-gvisor:v${{ env.SUBSTRATE_VERSION }}
         run: |
           echo "Cache key: ${{ needs.setup.outputs.cache-key }}"
-          printf '%s\n' controller golang-adk claude-harness byo-a2a | xargs -P4 -n1 bash -c '
+          printf '%s\n' controller golang-adk claude-harness codex-harness byo-a2a | xargs -P4 -n1 bash -c '
             image="$1"
             DOCKER_BUILD_ARGS="--cache-from=type=gha,scope=${{ needs.setup.outputs.cache-key }}-e2e-${image} --cache-from=type=gha,scope=${{ env.CACHE_KEY_PREFIX }}-main-e2e-${image} --cache-to=type=gha,scope=${{ needs.setup.outputs.cache-key }}-e2e-${image},mode=max --platform=linux/amd64 --push" \
               make GIT_COMMIT=e2e BUILD_DATE=1970-01-01 "build-${image}"
@@ -150,6 +150,9 @@ jobs:
           CLAUDE_DIGEST=$(docker buildx imagetools inspect "localhost:5001/kagent-dev/kagent/claude-harness:${VERSION}" | awk '$1 == "Digest:" { print $2; exit }')
           test -n "$CLAUDE_DIGEST"
           export KAGENT_E2E_CLAUDE_IMAGE="localhost:5001/kagent-dev/kagent/claude-harness@${CLAUDE_DIGEST}"
+          CODEX_DIGEST=$(docker buildx imagetools inspect "localhost:5001/kagent-dev/kagent/codex-harness:${VERSION}" | awk '$1 == "Digest:" { print $2; exit }')
+          test -n "$CODEX_DIGEST"
+          export KAGENT_E2E_CODEX_IMAGE="localhost:5001/kagent-dev/kagent/codex-harness@${CODEX_DIGEST}"
           envsubst < core/test/e2e/manifests/lifecycle.yaml.tmpl | kubectl apply -f -
           for _ in $(seq 1 60); do
             READY=$(kubectl get agenttemplate smoke -n kagent -o jsonpath='{.status.harnesses[?(@.harness=="kagent")].conditions[?(@.type=="Ready")].status}')
@@ -411,6 +414,7 @@ jobs:
           - cli
           - golang-adk
           - claude-harness
+          - codex-harness
     runs-on: ubuntu-latest
     services:
       registry:
