@@ -1,4 +1,4 @@
-package kagent
+package adkconfig
 
 import (
 	"context"
@@ -37,6 +37,20 @@ type modelRuntime struct {
 	Environment           []corev1.EnvVar
 	HasUnsupportedVolumes bool
 	data                  *modelDeploymentData
+}
+
+// resolveModel collapses provider-specific translation output into the subset
+// needed to compile a runtime revision.
+func (c *Builder) resolveModel(ctx context.Context, resolved *v2translator.ResolvedModelConfig) (*modelRuntime, error) {
+	model, data, err := c.translateModel(ctx, resolved)
+	if err != nil {
+		return nil, err
+	}
+	return &modelRuntime{
+		Model: model, Environment: data.EnvVars,
+		HasUnsupportedVolumes: len(data.Volumes) > 0 || len(data.VolumeMounts) > 0,
+		data:                  data,
+	}, nil
 }
 
 const (
@@ -191,11 +205,36 @@ func addTokenExchangeConfiguration(openai *adk.OpenAI, mdd *modelDeploymentData,
 	}
 }
 
+// resolveFoundryEndpoint returns the Foundry endpoint, preferring the inline
+// value and otherwise resolving it from the referenced ConfigMap (endpointFrom),
+// which lets Azure Service Operator own the account endpoint.
+func (c *Builder) resolveFoundryEndpoint(ctx context.Context, namespace string, cfg *v1alpha3.FoundryConfig) (string, error) {
+	if cfg.Endpoint != "" {
+		return cfg.Endpoint, nil
+	}
+	if cfg.EndpointFrom == nil {
+		return "", nil
+	}
+	ref := cfg.EndpointFrom
+	cm := &corev1.ConfigMap{}
+	if err := c.kube.Get(ctx, types.NamespacedName{Namespace: namespace, Name: ref.Name}, cm); err != nil {
+		return "", fmt.Errorf("failed to get Foundry endpoint config map %s: %w", ref.Name, err)
+	}
+	value, ok := cm.Data[ref.Key]
+	if !ok {
+		if ref.Optional != nil && *ref.Optional {
+			return "", nil
+		}
+		return "", fmt.Errorf("the Foundry endpoint config map %s does not contain key %q", ref.Name, ref.Key)
+	}
+	return value, nil
+}
+
 // translateModel owns the v2 ModelConfig-to-ADK mapping. The provider branches
 // are intentionally local rather than calling the legacy translator: v2 can
 // now evolve and eventually replace that code without a compatibility layer.
 // It returns the ADK wire model and its Kubernetes runtime requirements.
-func (c *Compiler) renderModel(ctx context.Context, resolved *v2translator.ResolvedModelConfig) (adk.Model, *modelDeploymentData, error) {
+func (c *Builder) translateModel(ctx context.Context, resolved *v2translator.ResolvedModelConfig) (adk.Model, *modelDeploymentData, error) {
 	if resolved == nil || resolved.Config == nil {
 		return nil, nil, fmt.Errorf("resolved model config is required")
 	}
@@ -710,19 +749,4 @@ func (c *Compiler) renderModel(ctx context.Context, resolved *v2translator.Resol
 	default:
 		return nil, nil, fmt.Errorf("unsupported model provider: %s", model.Spec.Provider)
 	}
-}
-
-func (c *Compiler) resolveFoundryEndpoint(ctx context.Context, namespace string, cfg *v1alpha3.FoundryConfig) (string, error) {
-	if cfg.Endpoint != "" {
-		return cfg.Endpoint, nil
-	}
-	if cfg.EndpointFrom == nil {
-		return "", nil
-	}
-	ref := cfg.EndpointFrom
-	configMap := &corev1.ConfigMap{}
-	if err := c.kube.Get(ctx, types.NamespacedName{Namespace: namespace, Name: ref.Name}, configMap); err != nil {
-		return "", fmt.Errorf("get Foundry endpoint ConfigMap %q: %w", ref.Name, err)
-	}
-	return configMap.Data[ref.Key], nil
 }

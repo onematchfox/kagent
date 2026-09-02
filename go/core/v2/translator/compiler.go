@@ -27,6 +27,7 @@ const (
 	HarnessTypeKagent HarnessType = "kagent"
 	HarnessTypeCodex  HarnessType = "codex"
 	HarnessTypeClaude HarnessType = "claude"
+	HarnessTypeBYO    HarnessType = "byo"
 )
 
 // HarnessCompiler converts resolved, harness-neutral inputs into one runtime revision.
@@ -112,6 +113,8 @@ func harnessType(harness *v1alpha3.Harness) HarnessType {
 		return HarnessTypeCodex
 	case harness.Spec.Claude != nil:
 		return HarnessTypeClaude
+	case harness.Spec.BYO != nil:
+		return HarnessTypeBYO
 	default:
 		return ""
 	}
@@ -197,15 +200,17 @@ func (c *Compiler) buildInputs(ctx context.Context, tree *ResolvedTree) (*Harnes
 			return nil, err
 		}
 		input := &AgentInput{Template: template, Instruction: instruction}
-		input.ResolvedModelConfig, err = c.kube.GetResolvedModelConfig(ctx, types.NamespacedName{Namespace: template.Namespace, Name: template.Spec.ModelConfig.Name})
-		if err != nil {
-			return nil, fmt.Errorf("resolve ModelConfig %q: %w", template.Spec.ModelConfig.Name, err)
-		}
-		if failures := input.ResolvedModelConfig.SemanticFailures; len(failures) > 0 {
-			return nil, NewValidationError("ModelConfig %q: %s", template.Spec.ModelConfig.Name, failures[0].Message)
-		}
-		if failures := input.ResolvedModelConfig.ReferenceFailures; len(failures) > 0 {
-			return nil, fmt.Errorf("resolve ModelConfig %q: %s", template.Spec.ModelConfig.Name, failures[0].Message)
+		if template.Spec.ModelConfig != nil {
+			input.ResolvedModelConfig, err = c.kube.GetResolvedModelConfig(ctx, types.NamespacedName{Namespace: template.Namespace, Name: template.Spec.ModelConfig.Name})
+			if err != nil {
+				return nil, fmt.Errorf("resolve ModelConfig %q: %w", template.Spec.ModelConfig.Name, err)
+			}
+			if failures := input.ResolvedModelConfig.SemanticFailures; len(failures) > 0 {
+				return nil, NewValidationError("ModelConfig %q: %s", template.Spec.ModelConfig.Name, failures[0].Message)
+			}
+			if failures := input.ResolvedModelConfig.ReferenceFailures; len(failures) > 0 {
+				return nil, fmt.Errorf("resolve ModelConfig %q: %s", template.Spec.ModelConfig.Name, failures[0].Message)
+			}
 		}
 		toolNames := make([]string, 0)
 		for _, tool := range template.Spec.Tools {

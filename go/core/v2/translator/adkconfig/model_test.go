@@ -1,4 +1,4 @@
-package kagent
+package adkconfig
 
 import (
 	"context"
@@ -46,7 +46,7 @@ func TestRenderBedrockCredentialsFromReferences(t *testing.T) {
 				},
 				References: tt.references,
 			}
-			_, data, err := (&Compiler{}).renderModel(context.Background(), resolved)
+			_, data, err := (&Builder{}).translateModel(context.Background(), resolved)
 			require.NoError(t, err)
 			names := make([]string, 0, len(data.EnvVars))
 			for _, variable := range data.EnvVars {
