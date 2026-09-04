@@ -47,7 +47,7 @@ ARG TOOLS_PYTHON_VERSION=3.13
 
 RUN --mount=type=cache,target=/var/cache/apk,rw \
     apk add --no-cache \
-    bash ca-certificates curl nodejs bubblewrap socat python-${TOOLS_PYTHON_VERSION} ripgrep libstdc++
+    bash ca-certificates git curl nodejs bubblewrap socat python-${TOOLS_PYTHON_VERSION} ripgrep libstdc++
 
 RUN addgroup -g 1001 goagent && \
     adduser -u 1001 -G goagent -s /bin/bash -D goagent
