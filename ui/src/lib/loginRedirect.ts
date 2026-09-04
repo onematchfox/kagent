@@ -16,7 +16,9 @@ export function sanitizeRedirect(rd: string | undefined): string {
   if (!rd) return "/";
   try {
     const url = new URL(rd, SENTINEL_ORIGIN);
-    if (url.origin !== SENTINEL_ORIGIN) return "/";
+    if (url.origin !== SENTINEL_ORIGIN || url.pathname.startsWith("//")) {
+      return "/";
+    }
     return url.pathname + url.search + url.hash;
   } catch {
     return "/";
