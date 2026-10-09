@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 
+	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	"github.com/kagent-dev/kagent/go/core/pkg/auth"
 	"go.opentelemetry.io/otel/propagation"
@@ -64,6 +65,10 @@ func (u *upstreamAuthInterceptor) Before(ctx context.Context, req *a2aclient.Req
 		if err := u.authProvider.UpstreamAuth(httpReq, session, upstreamPrincipal); err != nil {
 			return ctx, nil, err
 		}
+		// A share grants access to the owner's session, so the runtime must key its session lookup on the owner.
+		if sc, ok := auth.ShareContextFrom(ctx); ok && messageContextID(req.Payload) == sc.SessionID {
+			httpReq.Header.Set("X-User-Id", sc.UserID)
+		}
 	}
 	propagation.TraceContext{}.Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
 	for k, values := range httpReq.Header {
@@ -72,4 +77,12 @@ func (u *upstreamAuthInterceptor) Before(ctx context.Context, req *a2aclient.Req
 		}
 	}
 	return ctx, nil, nil
+}
+
+// messageContextID returns the context ID of a message send request, or "" for any other payload.
+func messageContextID(payload any) string {
+	if r, ok := payload.(*a2atype.SendMessageRequest); ok && r != nil && r.Message != nil {
+		return r.Message.ContextID
+	}
+	return ""
 }
